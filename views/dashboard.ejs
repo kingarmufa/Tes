@@ -1,0 +1,72 @@
+<%- include('partials/header', { title: 'Dashboard' }) %>
+
+<style>
+  :root {
+    --blue-500: #3b82f6;
+    --blue-50: #eff6ff;
+  }
+  .text-blue-500 { color: var(--blue-500); }
+  .bg-blue-50 { background-color: var(--blue-50); }
+</style>
+
+<div class="max-w-3xl mx-auto px-6 pb-2 mt-1">
+
+  <div class="flex items-center justify-between mb-4">
+    <h1 class="text-base font-medium text-gray-800">Dashboard</h1>
+          <span class="text-[13.5px] font-medium text-gray-800"><a href="/profile" class="inline-flex items-center text-[13.5px] font-medium text-blue-500 transition-colors">          
+          <%= user.email.replace(/^(.{3})[^@]*(?=@)/, '$1****') %>
+        </a></span>
+  </div>
+  
+  <div class="bg-white border border-gray-100 rounded-2xl shadow-sm shadow-gray-200/50 hover:shadow-md transition-shadow duration-300 mb-6">
+    <div class="bg-gray-50 border-b border-gray-200 px-4 py-2">
+      <span class="text-sm font-medium text-gray-800">Total Saldo Aktif</span>
+    </div>
+    
+    <div class="px-4 py-5">
+      <div class="flex items-center justify-start gap-2">
+        <h2 id="balanceReal" class="text-base font-medium text-gray-800 flex items-baseline gap-1 mb-0">
+          <span class="text-base font-medium">Rp</span> <%= user.balance.toLocaleString('id-ID') %>
+        </h2>
+        <h2 id="balanceHidden" class="text-base font-medium text-gray-800 hidden mb-0">
+          Rp •••••••
+        </h2>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-6">
+    <div class="bg-white border border-gray-100 rounded-2xl shadow-sm shadow-gray-200/50 hover:shadow-md transition-shadow duration-300">
+      <div class="bg-gray-50 border-b border-gray-200 px-4 py-2">
+        <p class="text-sm font-medium text-gray-800 mb-0">Total Pemasukan</p>
+      </div>
+      <div class="px-4 py-5">
+        <p class="text-base font-medium text-gray-800 mb-0">Rp <%= totalDeposit.toLocaleString('id-ID') %></p>
+      </div>
+    </div>
+
+    <div class="bg-white border border-gray-100 rounded-2xl shadow-sm shadow-gray-200/50 hover:shadow-md transition-shadow duration-300">
+      <div class="bg-gray-50 border-b border-gray-200 px-4 py-2">
+        <p class="text-sm font-medium text-gray-800 mb-0">Total Pengeluaran</p>
+      </div>
+      <div class="px-4 py-5">
+        <p class="text-base font-medium text-gray-800 mb-0">Rp <%= totalWithdraw.toLocaleString('id-ID') %></p>
+      </div>
+    </div>
+
+    <div class="bg-white border border-gray-100 rounded-2xl shadow-sm shadow-gray-200/50 hover:shadow-md transition-shadow duration-300">
+      <div class="bg-gray-50 border-b border-gray-200 px-4 py-2">
+        <p class="text-sm font-medium text-gray-800 mb-0">Total Transaksi</p>
+      </div>
+      <div class="px-4 py-5">
+        <p class="text-base font-medium text-gray-800"><%= recentTrx.length %> Transaksi</p>
+        <a href="/deposit" class="inline-flex items-center gap-1 text-[13.5px] font-medium text-blue-500 transition-colors">
+          Lihat Semua Transaksi <i class="fas fa-arrow-right text-[9.5px]"></i>
+        </a>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<%- include('partials/footer') %>
