@@ -1,0 +1,2298 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const session = require('express-session');
+const MemoryStore = require('memorystore')(session);
+const rateLimit = require('express-rate-limit');
+const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
+const { Telegraf } = require('telegraf');
+const archiver = require('archiver');
+
+const app = express();
+app.set('trust proxy', 1);
+const PORT = process.env.PORT || 3000;
+
+// ================== CUSTOM ID PREFIX ==================
+const startId = {
+  apikey: 'Nexapay',
+  invoice: 'INV',
+  withdraw: 'WD',
+  transaction: 'TRX'
+};
+
+// ================== MIDDLEWARE DASAR ==================
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(session({
+  secret: crypto.randomBytes(32).toString('hex'),
+  resave: false,
+  store: new MemoryStore({ checkPeriod: 86400000 }),
+  saveUninitialized: false,
+  cookie: { maxAge: 24 * 60 * 60 * 1000 }
+}));
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+// ================== RATE LIMITER ==================
+const Limiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 5,
+  handler: (req, res) => {
+    req.session.errorMsg = 'Terlalu banyak percobaan. Silakan coba lagi setelah 5 menit.';
+    res.redirect('/login');
+  }
+});
+
+const ApiLimiter = rateLimit({
+  windowMs: 5 * 1000,
+  max: 1,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.json({
+      success: false,
+      message: 'Terlalu banyak request. Tunggu 5 detik lalu coba lagi.'
+    });
+  }
+});
+
+// ================== MONGODB CONNECTION ==================
+let botManager = null;
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(async () => {
+    console.log('✅ MongoDB terhubung');
+    await seed();
+    botManager = new BotManager({ Setting, User, Transaction, Stats });
+    await botManager.init();
+    await botManager.manageBot();
+  })
+  .catch(err => console.error('❌ MongoDB gagal:', err));
+
+// ================== CUSTOM ID GENERATOR ==================
+function generateCustomId(prefix) {
+  const len = 12 - prefix.length;
+  const randomHex = crypto.randomBytes(Math.ceil(len / 2)).toString('hex').substring(0, len);
+  return prefix + randomHex;
+}
+
+function generateApiKey() {
+  return startId.apikey + '_' + crypto.randomUUID().replace(/-/g, '').substring(0, 16);
+}
+
+// ================== MONGOOSE MODELS ==================
+const userSchema = new mongoose.Schema({
+  username: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true,
+    validate: {
+      validator: function(v) { return /^[a-zA-Z0-9]+$/.test(v); },
+      message: 'Username hanya boleh berisi huruf dan angka (tanpa spasi atau simbol)'
+    },
+    maxlength: [15, 'Username maksimal 15 karakter']
+  },
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  balance: { type: Number, default: 0 },
+  role: { type: String, default: 'user', enum: ['user', 'admin'] },
+  suspended: { type: Boolean, default: false },
+  resetPasswordToken: String,
+  resetPasswordExpires: Date,
+  projectName: { type: String, default: '' },
+  callbackUrl: { type: String, default: '' },
+  merchantLogoUrl: { type: String, default: '' },
+  createdAt: { type: Date, default: Date.now }
+});
+const User = mongoose.model('User', userSchema);
+
+const transactionSchema = new mongoose.Schema({
+  _id: { type: String, default: () => generateCustomId(startId.transaction) },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  type: { type: String, enum: ['deposit', 'withdraw'] },
+  amount: Number,
+  fee: Number,
+  total: Number,
+  qris_image: String,
+  trxid: String,
+  mutationId: { type: String, default: null },
+  expiredAt: Date,
+  status: { type: String, default: 'pending', enum: ['pending', 'paid', 'expired', 'success', 'rejected'] },
+  reference: String,
+  createdAt: { type: Date, default: Date.now },
+  adminNote: String,
+  completedAt: Date,
+  method: String,
+  accountNumber: String,
+  instant: { type: Boolean, default: false },
+  destination: String,
+  h2hRefId: String,
+  h2hResponse: String,
+  methodCode: String,
+  balanceAfter: { type: Number, default: null }
+});
+const Transaction = mongoose.model('Transaction', transactionSchema);
+
+const apiKeySchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  key: { type: String, unique: true },
+  createdAt: { type: Date, default: Date.now }
+});
+const ApiKey = mongoose.model('ApiKey', apiKeySchema);
+
+const settingSchema = new mongoose.Schema({
+  name: { type: String, default: 'Sky Gateway' },
+  title: { type: String, default: 'Layanan Payment Gateway' },
+  description: { type: String, default: 'Terima pembayaran melalui QRIS Payment untuk Aplikasi atau Platform Bisnis kamu dengan mudah, cepat, dan aman.' },
+  contactDeveloper: { type: String, default: 'https://t.me/Xskycode' },
+  channelInformation: { type: String, default: 'https://whatsapp.com/channel/0029VbCTqG7Fsn0fJzxg1B1H' },
+  minDeposit: { type: Number, default: 1000 },
+  minWithdraw: { type: Number, default: 5000 },
+  minFee: { type: Number, default: 0 },
+  maxFee: { type: Number, default: 500 },
+  checkInterval: { type: Number, default: 30 },
+  qrisExpiredMinutes: { type: Number, default: 30 },
+  smtpUser: { type: String, default: '' },
+  smtpPass: { type: String, default: '' },
+  logoUrl: { type: String, default: 'https://img2.pixhost.to/images/8187/731158188_skyzo.png' },
+  gopayDomain: { type: String, default: 'gomerch.vercel.app' },
+  gopayToken: { type: String, default: '' },
+  gopayStaticQr: { type: String, default: '' },
+  gopayRefreshToken: { type: String, default: '' },
+  paymentGateway: { type: String, default: 'gopaymerchant', enum: ['gopaymerchant', 'orderkuota'] },
+  orderkuotaDomain: { type: String, default: '' },
+  orderkuotaApiKey: { type: String, default: '' },
+  orderkuotaUsername: { type: String, default: '' },
+  orderkuotaToken: { type: String, default: '' },
+  telegramBotToken: { type: String, default: '' },
+  telegramOwnerId: { type: String, default: '' },
+  telegramBotEnabled: { type: Boolean, default: false },
+  withdrawMethods: {
+    type: [
+      {
+        name: { type: String, required: true },
+        fee: { type: Number, required: true, default: 1000 },
+        min: { type: Number, default: 0 },
+        max: { type: Number, default: 1000000 }
+      }
+    ],
+    default: [
+      { name: 'Dana', fee: 1000, min: 10000, max: 1000000 },
+      { name: 'GoPay', fee: 2000, min: 10000, max: 1000000 }
+    ]
+  },
+  h2hIdMerchant: { type: String, default: '' },
+  h2hPin: { type: String, default: '' },
+  h2hPassword: { type: String, default: '' },
+  instantWithdrawMethods: {
+    type: [
+      {
+        name: { type: String, required: true },
+        code: { type: String, required: true },
+        fee: { type: Number, required: true, default: 1000 },
+        minAmount: { type: Number, required: true, default: 10000 },
+        maxAmount: { type: Number, default: 1000000 },
+        active: { type: Boolean, default: true }
+      }
+    ],
+    default: [
+      { name: 'Dana', code: 'BBSD', fee: 1000, minAmount: 10000, maxAmount: 1000000, active: true },
+      { name: 'GoPay', code: 'BBSGOP', fee: 2000, minAmount: 10000, maxAmount: 1000000, active: true }
+    ]
+  }
+});
+const Setting = mongoose.model('Setting', settingSchema);
+
+const statsSchema = new mongoose.Schema({
+  totalDepositAmount: { type: Number, default: 0 },
+  totalDepositFee: { type: Number, default: 0 },
+  totalWithdrawAmount: { type: Number, default: 0 },
+  totalWithdrawFee: { type: Number, default: 0 },
+  totalUsers: { type: Number, default: 0 },
+  totalTransactions: { type: Number, default: 0 },
+  totalUserBalance: { type: Number, default: 0 }
+});
+const Stats = mongoose.model('Stats', statsSchema);
+
+// ================== UPLOAD CONFIGURATIONS ==================
+const uploadsDir = path.join(__dirname, 'public');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+const logoStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    try {
+      const existingFiles = fs.readdirSync(uploadsDir);
+      for (const f of existingFiles) {
+        if (f.startsWith('icon.')) {
+          fs.unlinkSync(path.join(uploadsDir, f));
+        }
+      }
+    } catch (err) {}
+    cb(null, 'icon' + ext);
+  }
+});
+
+const logoUpload = multer({
+  storage: logoStorage,
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) return cb(new Error('Hanya file gambar yang diizinkan'), false);
+    cb(null, true);
+  }
+});
+
+// ================== ANTI-DUPLICATE HELPER ==================
+async function createWithRetry(Model, data, maxRetries = 5, customIdGen = null) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      if (customIdGen && !data._id) data._id = customIdGen();
+      return await Model.create(data);
+    } catch (err) {
+      if (err.code === 11000 && attempt < maxRetries - 1) {
+        if (customIdGen) data._id = customIdGen();
+        else if (Model === ApiKey) data.key = generateApiKey();
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Gagal membuat dokumen setelah beberapa kali percobaan (duplicate ID)');
+}
+
+// ================== HELPERS ==================
+async function getSettings() {
+  let s = await Setting.findOne();
+  if (!s) s = await Setting.create({});
+  return s;
+}
+
+async function computeStats() {
+  const [depositAgg, withdrawAgg, totalUsers, totalTrx, balanceAgg] = await Promise.all([
+    Transaction.aggregate([{ $match: { type: 'deposit', status: 'paid' } }, { $group: { _id: null, totalAmount: { $sum: '$amount' }, totalFee: { $sum: '$fee' } } }]),
+    Transaction.aggregate([{ $match: { type: 'withdraw', status: 'success' } }, { $group: { _id: null, totalAmount: { $sum: '$amount' }, totalFee: { $sum: '$fee' } } }]),
+    User.countDocuments({ role: 'user' }),
+    Transaction.countDocuments(),
+    User.aggregate([{ $match: { role: 'user' } }, { $group: { _id: null, totalBalance: { $sum: '$balance' } } }])
+  ]);
+
+  const dAmount = depositAgg[0]?.totalAmount || 0;
+  const dFee = depositAgg[0]?.totalFee || 0;
+  const wAmount = withdrawAgg[0]?.totalAmount || 0;
+  const wFee = withdrawAgg[0]?.totalFee || 0;
+  const totalUserBalance = balanceAgg[0]?.totalBalance || 0;
+
+  await Stats.findOneAndUpdate({}, {
+    totalDepositAmount: dAmount,
+    totalDepositFee: dFee,
+    totalWithdrawAmount: wAmount,
+    totalWithdrawFee: wFee,
+    totalUsers,
+    totalTransactions: totalTrx,
+    totalUserBalance
+  }, { upsert: true });
+
+  return { totalDepositAmount: dAmount, totalDepositFee: dFee, totalWithdrawAmount: wAmount, totalWithdrawFee: wFee, totalUsers, totalTransactions: totalTrx, totalUserBalance };
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return salt + ':' + crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+}
+
+function verifyPassword(password, stored) {
+  if (!stored || !stored.includes(':')) return false;
+  const [salt, hash] = stored.split(':');
+  return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex') === hash;
+}
+
+async function sendWebhook(user, event, data) {
+  if (!user || !user.callbackUrl) return;
+  try {
+    await axios.post(user.callbackUrl, { event, data, timestamp: new Date().toISOString() }, { timeout: 5000, headers: { 'Content-Type': 'application/json' } });
+  } catch (err) { console.error(`Callback gagal untuk user ${user.username}:`, err.message); }
+}
+
+// ================== GOPAY TOKEN REFRESH & RETRY ==================
+let refreshingPromise = null;
+
+async function refreshGopayToken() {
+  const settings = await getSettings();
+  if (!settings.gopayRefreshToken) {
+    const err = new Error('Refresh token tidak tersedia. Harap isi di pengaturan admin.');
+    if (botManager) botManager.notifyError('refreshGopayToken', err.message);
+    throw err;
+  }
+  const gopayBase = settings.gopayDomain || 'gomerch.vercel.app';
+  const refreshUrl = `https://${gopayBase}/auth/refresh/token?refresh_token=${encodeURIComponent(settings.gopayRefreshToken)}`;
+  try {
+    const resp = await axios.get(refreshUrl);
+    const res = resp.data;
+    if (!res.success) {
+      const err = new Error(res.error || 'Gagal refresh token');
+      if (botManager) botManager.notifyError('/auth/refresh/token', err.message);
+      throw err;
+    }
+    const newToken = res.data.access_token;
+    const newRefreshToken = res.data.refresh_token;
+    const updateFields = { gopayToken: newToken };
+    if (newRefreshToken) updateFields.gopayRefreshToken = newRefreshToken;
+    await Setting.updateOne({}, updateFields);
+    console.log('✅ Gopay token berhasil diperbarui');
+    return newToken;
+  } catch (err) {
+    console.error('❌ Gagal refresh Gopay token:', err.response?.data || err.message);
+    if (botManager) botManager.notifyError('/auth/refresh/token', err.response?.data?.error || err.message);
+    throw new Error('Gagal memperbarui token Gopay. Refresh token mungkin sudah kadaluarsa.');
+  }
+}
+
+async function callGopayApiWithRetry(url, options = {}, maxRetries = 1) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await axios({ url, ...options });
+      return response.data;
+    } catch (err) {
+      const isTokenError =
+        (err.response && err.response.status === 401) ||
+        (err.response?.data?.error &&
+          (typeof err.response.data.error === 'string'
+            ? /Expired token/i.test(err.response.data.error)
+            : /Expired token/i.test(err.response.data.error?.message || '')));
+      if (isTokenError && attempt < maxRetries) {
+        console.log('🔄 Token expired, mencoba refresh...');
+        if (!refreshingPromise) {
+          refreshingPromise = refreshGopayToken().finally(() => { refreshingPromise = null; });
+        }
+        await refreshingPromise;
+        const settings = await getSettings();
+        if (url.includes('token=')) url = url.replace(/token=[^&]*/, `token=${encodeURIComponent(settings.gopayToken)}`);
+        continue;
+      }
+      lastError = err;
+      break;
+    }
+  }
+  if (lastError && botManager) botManager.notifyError(url, lastError.response?.data?.error || lastError.message);
+  throw lastError;
+}
+
+// ================== BOT MANAGER CLASS ==================
+class BotManager {
+  constructor(models) {
+    this.models = models;
+    this.bot = null;
+    this.running = false;
+    this.settings = null;
+  }
+
+  async init() {
+    this.settings = await this.models.Setting.findOne();
+  }
+
+  async updateSettings(newSettings) {
+    this.settings = newSettings;
+    await this.manageBot();
+  }
+
+  async manageBot() {
+    if (!this.settings) return;
+    const { telegramBotEnabled, telegramBotToken, telegramOwnerId } = this.settings;
+    if (telegramBotEnabled && telegramBotToken && telegramOwnerId) {
+      if (!this.running) {
+        await this.startBot(telegramBotToken, telegramOwnerId);
+      } else if (this.bot && this.bot.token !== telegramBotToken) {
+        await this.stopBot();
+        await this.startBot(telegramBotToken, telegramOwnerId);
+      }
+    } else {
+      if (this.running) await this.stopBot();
+    }
+  }
+
+  async restartBot() {
+    if (!this.settings) throw new Error('Settings belum dimuat.');
+    const { telegramBotToken, telegramOwnerId } = this.settings;
+    if (!telegramBotToken || !telegramOwnerId) throw new Error('Token Bot atau Owner ID belum diisi di Pengaturan.');
+    await this.stopBot();
+    await this.startBot(telegramBotToken, telegramOwnerId);
+  }
+
+  async startBot(token, ownerId) {
+    this.bot = new Telegraf(token);
+    this.ownerId = ownerId;
+
+    this.bot.command('stats', async (ctx) => {
+      const stats = await computeStats();
+      const pendingManual = await this.models.Transaction.countDocuments({
+        type: 'withdraw',
+        instant: false,
+        status: 'pending'
+      });
+      const isOwner = ctx.from.id.toString() === this.ownerId.toString();
+      const msg =
+        `📊 *Statistik Keuangan ${this.settings.name}*\n` +
+        `_- Total Deposit:_ Rp ${stats.totalDepositAmount.toLocaleString('id-ID')}\n` +
+        (isOwner
+          ? `_- Total Fee Deposit:_ Rp ${stats.totalDepositFee.toLocaleString('id-ID')}\n`
+          : "") +
+        `_- Total Withdraw:_ Rp ${stats.totalWithdrawAmount.toLocaleString('id-ID')}\n` +
+        (isOwner
+          ? `_- Total Fee Withdraw:_ Rp ${stats.totalWithdrawFee.toLocaleString('id-ID')}\n`
+          : "") +
+        `_- Total Pengguna:_ ${stats.totalUsers}\n` +
+        `_- Total Transaksi:_ ${stats.totalTransactions}\n` +
+        `_- Total Saldo User:_ Rp ${stats.totalUserBalance.toLocaleString('id-ID')}\n` +
+        `_- Request Withdraw:_ ${pendingManual} permintaan`;
+      ctx.replyWithMarkdown(msg);
+    });
+
+    this.bot.command('menu', async (ctx) => {
+      const keyboard = [
+        [{ text: '📊 Stats', callback_data: 'stats' }, { text: '📤 Backup Script', callback_data: 'backup' }],
+        [{ text: `🌐 Buka Web ${this.settings.name}`, url: 'https://nexapay.kingarmufa.xyz' }]
+      ];
+      await ctx.reply(`_Hallo 👋_,\n_Saya adalah bot notifikasi_ *${this.settings.name}*`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    });
+
+    this.bot.command('sendpesan', async (ctx) => {
+      if (ctx.from.id.toString() !== this.ownerId.toString()) {
+        return ctx.reply('⚠️ Hanya owner yang dapat menggunakan fitur ini.');
+      }
+      const settings = await getSettings();
+      const channelRaw = settings.channelInformation;
+      if (!channelRaw) return ctx.reply('❌ Channel Telegram belum diatur di pengaturan admin (channelInformation).');
+      let chatId;
+      if (channelRaw.startsWith('https://t.me/')) chatId = '@' + channelRaw.split('/').pop().split('?')[0];
+      else if (channelRaw.startsWith('@') || channelRaw.startsWith('-')) chatId = channelRaw;
+      else chatId = '@' + channelRaw;
+
+      let messageText = '';
+      let photoFileId = null;
+      if (ctx.message?.reply_to_message?.photo) {
+        const photo = ctx.message.reply_to_message.photo;
+        const fil = photo[photo.length - 1];
+        photoFileId = fil.file_id;
+        messageText = ctx.message.text || '';
+      } else {
+        messageText = ctx.message.text || '';
+      }
+      messageText = messageText.replace(/^\/sendpesan(@\w+)?\s*/, '');
+
+      let customUrl = null;
+      if (messageText.includes('|')) {
+        const parts = messageText.split('|');
+        messageText = parts[0].trim();
+        const rawUrl = parts.slice(1).join('|').trim();
+        if (rawUrl) customUrl = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`;
+      } else {
+        messageText = messageText.trim();
+      }
+
+      if (!messageText && !photoFileId) {
+        return ctx.reply('ℹ️ Format penggunaan:\n/sendpesan <teks pesan>\n/sendpesan <teks>|<url>\n\nContoh:\n/sendpesan Promo spesial\n/sendpesan Diskon besar|https://s.id/promo\n\nBisa juga reply foto dengan caption /sendpesan ...');
+      }
+
+      const sendOptions = {};
+      if (customUrl) {
+        sendOptions.reply_markup = {
+          inline_keyboard: [[{ text: '🌐 Website NexaPay', url: 'https://nexapay.kingarmufa.xyz' }]]
+        };
+      }
+
+      try {
+        if (photoFileId) {
+          await ctx.telegram.sendPhoto(chatId, photoFileId, { caption: messageText, ...sendOptions, parse_mode: 'Markdown' });
+        } else {
+          await ctx.telegram.sendMessage(chatId, messageText, sendOptions);
+        }
+        await ctx.reply('✅ Pesan berhasil dikirim ke channel.');
+      } catch (err) {
+        console.error('Gagal kirim pesan ke channel:', err);
+        ctx.reply('❌ Gagal mengirim pesan ke channel: ' + err.message);
+        this.notifyError('/sendpesan', err.message);
+      }
+    });
+
+    this.bot.command('backup', async (ctx) => {
+      if (ctx.from.id.toString() !== this.ownerId.toString()) return ctx.reply('⚠️ Hanya owner yang dapat menggunakan fitur ini.');
+      this.createBackup(ctx);
+    });
+
+    this.bot.action('backup', async (ctx) => {
+      if (ctx.from.id.toString() !== this.ownerId.toString()) { await ctx.answerCbQuery('⚠️ Hanya owner.'); return; }
+      await ctx.answerCbQuery();
+      this.createBackup(ctx);
+    });
+
+    this.bot.action('stats', async (ctx) => {
+      await ctx.answerCbQuery();
+      const stats = await computeStats();
+      const pendingManual = await this.models.Transaction.countDocuments({
+        type: 'withdraw',
+        instant: false,
+        status: 'pending'
+      });
+      const isOwner = ctx.from.id.toString() === this.ownerId.toString();
+      const msg =
+        `📊 *Statistik Keuangan ${this.settings.name}*\n` +
+        `_- Total Deposit:_ Rp ${stats.totalDepositAmount.toLocaleString('id-ID')}\n` +
+        (isOwner
+          ? `_- Total Fee Deposit:_ Rp ${stats.totalDepositFee.toLocaleString('id-ID')}\n`
+          : "") +
+        `_- Total Withdraw:_ Rp ${stats.totalWithdrawAmount.toLocaleString('id-ID')}\n` +
+        (isOwner
+          ? `_- Total Fee Withdraw:_ Rp ${stats.totalWithdrawFee.toLocaleString('id-ID')}\n`
+          : "") +
+        `_- Total Pengguna:_ ${stats.totalUsers}\n` +
+        `_- Total Transaksi:_ ${stats.totalTransactions}\n` +
+        `_- Total Saldo User:_ Rp ${stats.totalUserBalance.toLocaleString('id-ID')}\n` +
+        `_- Request Withdraw:_ ${pendingManual} permintaan`;
+      await ctx.reply(msg, { parse_mode: 'Markdown' });
+    });
+
+    this.bot.on('callback_query', async (ctx) => {
+      const ownerId = this.ownerId.toString();
+      if (ctx.from.id.toString() !== ownerId) return;
+      const data = ctx.callbackQuery.data;
+      if (data.startsWith('approve_')) {
+        const wdId = data.split('_')[1];
+        await this.approveWithdrawal(ctx, wdId);
+      } else if (data.startsWith('reject_')) {
+        const wdId = data.split('_')[1];
+        await this.showRejectReasons(ctx, wdId);
+      } else if (data.startsWith('rejectReason_')) {
+        const [, wdId, reasonIndex] = data.split('_');
+        const reasons = ['Data Ewallet Tidak Valid', 'Nama Akun Tidak Valid', 'Metode Penarikan Tidak Valid'];
+        const reason = reasons[parseInt(reasonIndex)] || 'Alasan tidak diketahui';
+        await this.rejectWithdrawal(ctx, wdId, reason);
+      } else if (data.startsWith('cancelReject_')) {
+        const wdId = data.split('_')[1];
+        const keyboard = { inline_keyboard: [[{ text: '✅ Approve', callback_data: `approve_${wdId}` }, { text: '❌ Reject', callback_data: `reject_${wdId}` }]] };
+        try { await ctx.editMessageReplyMarkup(keyboard); } catch (e) { console.error(e); this.notifyError('/callback_query (cancelReject)', e.message); }
+      }
+      ctx.answerCbQuery();
+    });
+
+    this.bot.catch((err) => {
+      console.error('Bot error:', err);
+      this.notifyError('Bot Generic Error', err.message);
+    });
+
+    try {
+      this.bot.launch();
+      await this.bot.telegram.setMyCommands([
+        { command: "menu", description: "Menu Utama" },
+        { command: "stats", description: "Statistik" },
+        { command: "backup", description: "Backup Script" }
+      ]);
+      this.running = true;
+      console.log('✅ Bot Telegram berjalan');
+      try {
+        await this.bot.telegram.sendMessage(this.ownerId, '✅ *Bot Berhasil Tersambung*\nSiap mengirim notifikasi.', { parse_mode: 'Markdown' });
+      } catch (e) {
+        console.error('Gagal kirim notifikasi tersambung:', e.message);
+      }
+    } catch (e) {
+      console.error('❌ Gagal menjalankan bot:', e.message);
+      this.running = false;
+    }
+  }
+
+  async stopBot() {
+    if (this.bot) {
+      this.bot.stop();
+      this.bot = null;
+      this.running = false;
+      console.log('⏹️ Bot Telegram dihentikan');
+    }
+  }
+
+  isRunning() { return this.running; }
+
+  getChannelChatId() {
+    const raw = this.settings?.channelInformation;
+    if (!raw) return null;
+    if (raw.startsWith('https://t.me/')) return '@' + raw.split('/').pop().split('?')[0];
+    if (raw.startsWith('@') || raw.startsWith('-')) return raw;
+    return '@' + raw;
+  }
+
+  async sendToChannel(text, extra = {}) {
+    if (!this.running || !this.bot) return;
+    const chatId = this.getChannelChatId();
+    if (!chatId) return;
+    try {
+      await this.bot.telegram.sendMessage(chatId, text, { 
+      parse_mode: 'Markdown', 
+      reply_markup: { inline_keyboard: [
+       [{ text: `🌐 Website`, url: 'https://nexapay.kingarmufa.xyz' }]
+       ] }
+      });
+    } catch (e) {
+      console.error('Gagal kirim ke channel:', e.message);
+    }
+  }
+
+  sensorAccount(num) {
+    if (!num) return 'XXXXXX';
+    const str = String(num);
+    if (str.length <= 6) return 'XXXXXX';
+    return str.slice(0, -6) + 'XXXXXX';
+  }
+
+  formatTime(date = new Date()) {
+    return date.toLocaleString('id-ID', {
+      timeZone: 'Asia/Jakarta',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    }).replace(/\./g, ':');
+  }
+
+  async notifyDeposit(transaction, user) {
+    if (!this.running || !this.bot || !this.ownerId) return;
+    const msg = `🌐 *${this.settings.name} | Payment Gateway*\n\n*✅ Deposit Berhasil*\n` +
+      `ID: \`${transaction._id}\`\n` +
+      `User: ${user.username}\n` +
+      `Jumlah: Rp ${transaction.amount.toLocaleString('id-ID')}\n` +
+      `Biaya: Rp ${transaction.fee.toLocaleString('id-ID')}\n` +
+      `Total: Rp ${transaction.total.toLocaleString('id-ID')}\n` +
+      `Saldo Akhir: Rp ${user.balance.toLocaleString('id-ID')}\n\n` +
+      `_⏰ ${this.formatTime()}_`;
+    try { await this.bot.telegram.sendMessage(this.ownerId, msg, { parse_mode: 'Markdown' }); } catch (e) { console.error('Notif deposit gagal:', e); }
+    this.notifyDepositToChannel(transaction, user);
+    const userFull = await User.findById(user._id).lean();
+    sendWebhook(userFull, 'deposit.paid', { invoice_id: transaction._id, amount: transaction.amount, fee: transaction.fee, total: transaction.total, status: 'paid', balance_after: transaction.balanceAfter || user.balance });
+  }
+
+  async notifyDepositToChannel(transaction, user) {
+    const text = `🌐 *${this.settings.name} | Payment Gateway*\n\n*✅ Deposit Berhasil*\n` +
+      `ID: ${transaction._id}\n` +
+      `User: ${user.username}\n` +
+      `Jumlah: Rp ${transaction.amount.toLocaleString('id-ID')}\n` +
+      `Biaya: Rp ${transaction.fee.toLocaleString('id-ID')}\n` +
+      `Total: Rp ${transaction.total.toLocaleString('id-ID')}\n` +
+      `Saldo Akhir: Rp ${user.balance.toLocaleString('id-ID')}\n\n` +
+      `_⏰ ${this.formatTime()}_`;
+    await this.sendToChannel(text);
+  }
+
+  async notifyWithdrawRequest(transaction, user) {
+    if (!this.running || !this.bot || !this.ownerId) return;
+    const msg = `🌐 *${this.settings.name} | Payment Gateway*\n\n🏧 *Permintaan Withdraw Baru*\n` +
+      `ID: \`${transaction._id}\`\n` +
+      `User: ${user.username}\n` +
+      `Metode: ${transaction.method}\n` +
+      `No.Rekening: \`${transaction.accountNumber}\`\n` +
+      `Jumlah: Rp ${transaction.amount.toLocaleString('id-ID')}\n` +
+      `Biaya: Rp ${transaction.fee.toLocaleString('id-ID')}\n` +
+      `Saldo Akhir: Rp ${user.balance.toLocaleString('id-ID')}\n\n` +
+      `_⏰ ${this.formatTime()}_`;
+    const keyboard = { inline_keyboard: [[{ text: '✅ Approve', callback_data: `approve_${transaction._id}` }, { text: '❌ Reject', callback_data: `reject_${transaction._id}` }]] };
+    try {
+      const message = await this.bot.telegram.sendMessage(this.ownerId, msg, { reply_markup: keyboard, parse_mode: 'Markdown' });
+      await this.bot.telegram.pinChatMessage(this.ownerId, message.message_id, { disable_notification: true });
+    } catch (e) { console.error('Notif withdraw gagal:', e); }
+  }
+
+  async notifyInstantWithdraw(transaction, user, failed = false, reason = '') {
+    if (!this.running || !this.bot || !this.ownerId) return;
+    const header = failed ? '❌ *Withdraw Instan Gagal*' : '⚡ *Withdraw Instan Berhasil*';
+    const time = this.formatTime();
+    let msg = `🌐 *${this.settings.name} | Payment Gateway*\n\n${header}\n` +
+      `ID: \`${transaction._id}\`\n` +
+      `User: ${user.username}\n` +
+      `Metode: ${transaction.method}\n` +
+      `No.Rekening: \`${transaction.destination}\`\n` +
+      `Jumlah: Rp ${transaction.amount.toLocaleString('id-ID')}\n` +
+      `Biaya: Rp ${transaction.fee.toLocaleString('id-ID')}\n` +
+      `Saldo Akhir: Rp ${user.balance.toLocaleString('id-ID')}\n\n` +
+      `_⏰ ${time}_`;
+    if (failed && reason) msg += `\nAlasan: ${reason}`;
+    try { await this.bot.telegram.sendMessage(this.ownerId, msg, { parse_mode: 'Markdown' }); } catch (e) { console.error('Notif withdraw instan gagal:', e); }
+    if (!failed) {
+      this.notifyWithdrawSuccessToChannel(transaction, user);
+      const userFull = await User.findById(user._id).lean();
+      sendWebhook(userFull, 'withdraw.success', { withdraw_id: transaction._id, amount: transaction.amount, fee: transaction.fee, method: transaction.method, destination: transaction.destination || transaction.accountNumber, status: 'success', balance_after: transaction.balanceAfter || user.balance });
+    } else {
+      const userFull = await User.findById(user._id).lean();
+      sendWebhook(userFull, 'withdraw.rejected', { withdraw_id: transaction._id, amount: transaction.amount, fee: transaction.fee, method: transaction.method, reason, status: 'rejected', balance_after: transaction.balanceAfter || user.balance });
+    }
+  }
+
+  async notifyWithdrawSuccessToChannel(transaction, user) {
+    const tipe = transaction.instant ? 'Instan' : 'Manual';
+    const text = `🌐 *${this.settings.name} | Payment Gateway*\n\n*⚡ Withdraw Berhasil*\n` +
+      `ID: ${transaction._id}\n` +
+      `Tipe: ${tipe}\n` +
+      `User: ${user.username}\n` +
+      `Metode: ${transaction.method}\n` +
+      `No.Rekening: ${this.sensorAccount(transaction.destination || transaction.accountNumber)}\n` +
+      `Jumlah: Rp ${transaction.amount.toLocaleString('id-ID')}\n` +
+      `Biaya: Rp ${transaction.fee.toLocaleString('id-ID')}\n` +
+      `Saldo Akhir: Rp ${user.balance.toLocaleString('id-ID')}\n\n` +
+      `_⏰ ${this.formatTime()}_`;
+    await this.sendToChannel(text);
+  }
+
+  async notifyError(endpoint, errorMessage) {
+    if (!this.running || !this.bot || !this.ownerId) return;
+    const time = this.formatTime();
+    const msg = `⚠️ *Error Terdeteksi*\n_- Endpoint:_ \`${endpoint}\`\n_- Waktu:_ ${time}\n_- Pesan:_ ${errorMessage}`;
+    try { await this.bot.telegram.sendMessage(this.ownerId, msg, { parse_mode: 'Markdown' }); } catch (e) { console.error('Gagal kirim notifikasi error:', e); }
+  }
+
+  async createBackup(ctx) {
+    try {
+      const Id = await ctx.reply("🔄 Backup Processing...");
+      await ctx.telegram.deleteMessage(ctx.chat.id, Id.message_id);
+      const bulanIndo = ["Januari","Februari","Maret","April","Mei","Juni","Juli","Agustus","September","Oktober","November","Desember"];
+      const tgl = new Date();
+      const tanggal = tgl.getDate().toString().padStart(2,"0");
+      const bulan = bulanIndo[tgl.getMonth()];
+      const name = `NexaPay-${tanggal}-${bulan}-${tgl.getFullYear()}`;
+      const exclude = ["node_modules","package-lock.json","yarn.lock",".npm",".cache",".git"];
+      const filesToZip = fs.readdirSync(".").filter(f => !exclude.includes(f) && f !== "");
+      if (!filesToZip.length) return ctx.reply("❌ Tidak ada file yang dapat di backup!");
+      const output = fs.createWriteStream(`./${name}.zip`);
+      const archive = archiver("zip", { zlib: { level: 9 } });
+      output.on('close', async () => {
+        try {
+          await ctx.telegram.sendDocument(this.ownerId, { source: `./${name}.zip` }, { caption: `✅ <b>Backup Script selesai!</b>`, parse_mode: "HTML" });
+          fs.unlinkSync(`./${name}.zip`);
+          if (ctx.chat.id.toString() !== this.ownerId.toString()) await ctx.reply("✅ <b>Backup script selesai!</b>\n📁 File telah dikirim ke chat pribadi owner.", { parse_mode: "HTML" });
+        } catch (err) {
+          console.error("Gagal kirim file backup:", err);
+          this.notifyError('/backup (sendDocument)', err.message);
+          await ctx.reply("❌ Error! Gagal mengirim file backup.");
+        }
+      });
+      archive.on('error', async (err) => {
+        console.error("Archive Error:", err);
+        this.notifyError('/backup (archive)', err.message);
+        await ctx.reply("❌ Error! Gagal membuat file backup.");
+      });
+      archive.pipe(output);
+      for (let file of filesToZip) {
+        const stat = fs.statSync(file);
+        if (stat.isDirectory()) archive.directory(file, file);
+        else archive.file(file, { name: file });
+      }
+      await archive.finalize();
+    } catch (err) {
+      console.error("Backup Error:", err);
+      this.notifyError('/backup (global)', err.message);
+      await ctx.reply("❌ Error! Terjadi kesalahan saat proses backup.");
+    }
+  }
+
+  async approveWithdrawal(ctx, wdId) {
+    try {
+      const trx = await this.models.Transaction.findOne({ _id: wdId, type: 'withdraw' });
+      if (!trx || trx.status !== 'pending') return ctx.editMessageText('⚠️ Withdrawal tidak ditemukan atau sudah diproses.');
+      trx.status = 'success'; trx.completedAt = new Date(); await trx.save();
+      const newText = ctx.callbackQuery.message.text + '\n\n✅ *Approved*';
+      const message = await ctx.editMessageText(newText, { parse_mode: 'Markdown' });
+      await ctx.telegram.unpinChatMessage(ctx.chat.id, message.message_id, { disable_notification: true });
+      const user = await this.models.User.findById(trx.userId).lean();
+      if (user) {
+        this.notifyWithdrawSuccessToChannel(trx, user);
+        sendWebhook(user, 'withdraw.success', { withdraw_id: trx._id, amount: trx.amount, fee: trx.fee, method: trx.method, account_number: trx.accountNumber, status: 'success', balance_after: trx.balanceAfter || user.balance });
+      }
+    } catch (e) { console.error(e); this.notifyError('/approveWithdrawal', e.message); ctx.editMessageText('❌ Gagal approve.'); }
+  }
+
+  async showRejectReasons(ctx, wdId) {
+    const keyboard = { inline_keyboard: [
+      [{ text: '1. Data Ewallet Tidak Valid', callback_data: `rejectReason_${wdId}_0` }],
+      [{ text: '2. Nama Akun Tidak Valid', callback_data: `rejectReason_${wdId}_1` }],
+      [{ text: '3. Metode Penarikan Tidak Valid', callback_data: `rejectReason_${wdId}_2` }],
+      [{ text: '🔙 Batalkan', callback_data: `cancelReject_${wdId}` }]
+    ]};
+    await ctx.editMessageReplyMarkup(keyboard);
+  }
+
+  async rejectWithdrawal(ctx, wdId, reason) {
+    try {
+      const trx = await this.models.Transaction.findOne({ _id: wdId, type: 'withdraw' });
+      if (!trx || trx.status !== 'pending') return ctx.editMessageText('⚠️ Withdrawal tidak ditemukan atau sudah diproses.');
+      trx.status = 'rejected'; trx.adminNote = reason; trx.completedAt = new Date();
+      await this.models.User.findByIdAndUpdate(trx.userId, { $inc: { balance: trx.amount + trx.fee } });
+      const userAfter = await this.models.User.findById(trx.userId);
+      trx.balanceAfter = userAfter.balance;
+      await trx.save();
+      const newText = ctx.callbackQuery.message.text + `\n\n❌ *Ditolak*\nAlasan: ${reason}`;
+      const message = await ctx.editMessageText(newText, { parse_mode: 'Markdown' });
+      await ctx.telegram.unpinChatMessage(ctx.chat.id, message.message_id, { disable_notification: true });
+      const user = await this.models.User.findById(trx.userId).lean();
+      if (user) sendWebhook(user, 'withdraw.rejected', { withdraw_id: trx._id, amount: trx.amount, fee: trx.fee, method: trx.method, reason, status: 'rejected', balance_after: trx.balanceAfter || user.balance });
+    } catch (e) { console.error(e); this.notifyError('/rejectWithdrawal', e.message); ctx.editMessageText('❌ Gagal reject.'); }
+  }
+}
+
+// ================== GLOBAL MIDDLEWARE (AUTH) ==================
+app.use(async (req, res, next) => {
+  res.locals.user = null;
+  if (req.session.userId) {
+    try {
+      const user = await User.findById(req.session.userId);
+      if (user) res.locals.user = user.toObject();
+    } catch {}
+  }
+  res.locals.settings = await getSettings();
+  res.locals.error = req.session.errorMsg || null;
+  res.locals.success = req.session.successMsg || null;
+  delete req.session.errorMsg;
+  delete req.session.successMsg;
+  next();
+});
+
+function isAuth(req, res, next) {
+  if (req.session.userId) return next();
+  res.redirect('/login');
+}
+
+function isAdmin(req, res, next) {
+  if (req.session.userRole === 'admin') return next();
+  res.redirect('/login');
+}
+
+// ================== SEED ==================
+async function seed() {
+  const ex = await User.findOne({ role: "admin" });
+  if (!ex) {
+    await User.create({ username: 'admin', email: 'admin@gmail.com', password: hashPassword('admin123'), role: 'admin' });
+    console.log(`🔑 Admin Account Default\nUsername: admin\nPassword: admin123`);
+  }
+  const settings = await getSettings();
+  if (!settings.withdrawMethods || settings.withdrawMethods.length === 0) {
+    settings.withdrawMethods = [
+      { name: 'Dana', fee: 1000, min: 10000, max: 1000000 },
+      { name: 'GoPay', fee: 2000, min: 10000, max: 1000000 }
+    ];
+    await settings.save();
+  }
+}
+
+// ================== ROUTES DASHBOARD / AUTH ==================
+app.get('/', async (req, res) => {
+  res.render('home');
+});
+
+app.get('/login', (req, res) => {
+  if (req.session.userId) return res.redirect(req.session.userRole === 'admin' ? '/admin/dashboard' : '/dashboard');
+  res.render('login');
+});
+
+app.get('/register', (req, res) => {
+  if (req.session.userId) return res.redirect(req.session.userRole === 'admin' ? '/admin/dashboard' : '/dashboard');
+  res.render('register');
+});
+
+app.post('/login', Limiter, async (req, res) => {
+  const { login, password } = req.body;
+  if (!login || !password) { req.session.errorMsg = 'Harap isi semua field'; return res.redirect('/login'); }
+  const isEmail = login.includes('@');
+  let user;
+  if (isEmail) {
+    user = await User.findOne({ email: login.toLowerCase() });
+    if (user && user.role === 'admin') { req.session.errorMsg = 'Admin hanya dapat login menggunakan username'; return res.redirect('/login'); }
+  } else {
+    user = await User.findOne({ username: login.toLowerCase() });
+  }
+  if (!user || !verifyPassword(password, user.password)) { req.session.errorMsg = 'Username/email atau kata sandi salah'; return res.redirect('/login'); }
+  if (user.suspended) { req.session.errorMsg = 'Akun Anda dinonaktifkan'; return res.redirect('/login'); }
+  req.session.userId = user._id;
+  req.session.userRole = user.role;
+  if (user.role === 'admin') return res.redirect('/admin/dashboard');
+  res.redirect('/dashboard');
+});
+
+app.post('/register', Limiter, async (req, res) => {
+  const { username, email, password } = req.body;
+  const trimmedUsername = username?.trim() || '';
+  if (!trimmedUsername) { req.session.errorMsg = 'Username tidak boleh kosong'; return res.redirect('/register'); }
+  if (!/^[a-zA-Z0-9]+$/.test(trimmedUsername)) { req.session.errorMsg = 'Username hanya boleh berisi huruf dan angka'; return res.redirect('/register'); }
+  if (trimmedUsername.length > 15) { req.session.errorMsg = 'Username maksimal 15 karakter'; return res.redirect('/register'); }
+  const normalizedUsername = trimmedUsername.toLowerCase();
+  const normalizedEmail = email?.trim().toLowerCase();
+  try {
+    const existingUsername = await User.findOne({ username: normalizedUsername });
+    if (existingUsername) { req.session.errorMsg = 'Username sudah terdaftar'; return res.redirect('/register'); }
+    const existingEmail = await User.findOne({ email: normalizedEmail });
+    if (existingEmail) { req.session.errorMsg = 'Email sudah terdaftar'; return res.redirect('/register'); }
+    const user = await User.create({ username: normalizedUsername, email: normalizedEmail, password: hashPassword(password) });
+    await createWithRetry(ApiKey, { userId: user._id, key: generateApiKey() });
+    req.session.userId = user._id;
+    req.session.userRole = 'user';
+    return res.redirect('/dashboard');
+  } catch (err) {
+    if (err.name === 'ValidationError') {
+      req.session.errorMsg = Object.values(err.errors).map(e => e.message).join(', ');
+    } else {
+      req.session.errorMsg = 'Gagal mendaftar, periksa kembali data Anda';
+    }
+    return res.redirect('/register');
+  }
+});
+
+app.get('/forgot-password', (req, res) => {
+  if (req.session.userId) return res.redirect(req.session.userRole === 'admin' ? '/admin/dashboard' : '/dashboard');
+  res.render('forgot_password');
+});
+
+app.post('/forgot-password', Limiter, async (req, res) => {
+  const { login } = req.body;
+  if (!login) { req.session.errorMsg = 'Harap masukkan email atau username Anda.'; return res.redirect('/forgot-password'); }
+  try {
+    const settings = await getSettings();
+    if (!settings.smtpUser || !settings.smtpPass) { req.session.errorMsg = 'Fitur lupa password belum tersedia.'; return res.redirect('/forgot-password'); }
+    const isEmail = login.includes('@');
+    let user;
+    if (isEmail) user = await User.findOne({ email: login.toLowerCase() });
+    else user = await User.findOne({ username: login.toLowerCase() });
+    if (!user) { req.session.errorMsg = 'Akun tidak ditemukan.'; return res.redirect('/forgot-password'); }
+    if (!user.email) { req.session.errorMsg = 'Akun ini tidak memiliki alamat email yang valid.'; return res.redirect('/forgot-password'); }
+    const token = crypto.randomBytes(32).toString('hex');
+    user.resetPasswordToken = token;
+    user.resetPasswordExpires = Date.now() + 30 * 60 * 1000;
+    await user.save();
+    const resetLink = `http://${req.headers.host}/reset-password/${token}`;
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com', port: 587, secure: false,
+      auth: { user: settings.smtpUser, pass: settings.smtpPass },
+      tls: { rejectUnauthorized: false },
+      connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 10000
+    });
+    await transporter.sendMail({
+      to: user.email,
+      from: `"${settings.name}" <${settings.smtpUser}>`,
+      subject: `Permintaan Reset Password`,
+      html: `<div style="font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;background-color:#f9f9f9;padding:40px 20px;margin:0;"><div style="max-width:500px;margin:0 auto;background-color:#ffffff;border:1px solid #dddddd;border-radius:2px;overflow:hidden;"><div style="padding:28px 24px 0;text-align:center;"><h2 style="color:#1f2937;font-size:20px;font-weight:600;margin:0 0 4px;">${settings.name}</h2><p style="color:#1f2937;font-size:14px;margin:0 0 4px;">${settings.title}</p></div><div style="padding:24px;"><p style="color:#4b5563;font-size:14px;line-height:1.5;margin:0 0 20px;">Halo <strong style="color:#1f2937;">${user.username}</strong>,<br>Kami menerima permintaan untuk mengatur ulang kata sandi akun Anda di <strong>${settings.name}</strong>. Jika ini memang Anda, silakan klik tombol di bawah ini:</p><div style="text-align:center;margin-bottom:24px;"><a href="${resetLink}" style="display:inline-block;background-color:#3b82f6;color:#ffffff;text-decoration:none;padding:12px 28px;border-radius:2px;font-weight:600;font-size:14px;line-height:1.5;">Ganti Password Saya</a></div><p style="color:#dc2626;font-size:13px;font-weight:600;text-align:center;margin-bottom:24px;background-color:#fef2f2;border:1px solid #fecaca;padding:10px 14px;border-radius:2px;">Tautan ini hanya berlaku selama 30 menit.</p><div style="border-top:1px solid #dddddd;padding-top:20px;margin-top:8px;"><p style="color:#9ca3af;font-size:14px;line-height:1.5;margin:0;">Jika tombol di atas tidak berfungsi, salin dan tempel URL berikut ke browser Anda:<br><a href="${resetLink}" style="color:#3b82f6;word-break:break-all;text-decoration:none;">${resetLink}</a></p></div></div></div><div style="text-align:center;max-width:480px;margin:20px auto 0;"><p style="color:#9ca3af;font-size:14px;margin:0;">&copy; ${new Date().getFullYear()} ${settings.name}. All rights reserved.</p></div></div>`
+    });
+    req.session.successMsg = `Link reset password telah dikirim ke email.`;
+    res.redirect('/forgot-password');
+  } catch (error) {
+    console.error('Error Forgot Password:', error);
+    if (botManager) botManager.notifyError('/forgot-password', error.message);
+    req.session.errorMsg = 'Gagal memproses pesan email.';
+    res.redirect('/forgot-password');
+  }
+});
+
+app.get('/reset-password/:token', async (req, res) => {
+  try {
+    const user = await User.findOne({ resetPasswordToken: req.params.token, resetPasswordExpires: { $gt: Date.now() } });
+    if (!user) { req.session.errorMsg = 'Token reset password tidak valid atau sudah kedaluwarsa (berlaku 30 menit).'; return res.redirect('/forgot-password'); }
+    res.render('reset_password', { token: req.params.token });
+  } catch (error) { res.redirect('/login'); }
+});
+
+app.post('/reset-password/:token', async (req, res) => {
+  try {
+    const user = await User.findOne({ resetPasswordToken: req.params.token, resetPasswordExpires: { $gt: Date.now() } });
+    if (!user) { req.session.errorMsg = 'Token reset password tidak valid atau sudah kedaluwarsa.'; return res.redirect('/forgot-password'); }
+    const { password, confirmPassword } = req.body;
+    if (password !== confirmPassword) { req.session.errorMsg = 'Password dan konfirmasi password tidak cocok.'; return res.redirect(`/reset-password/${req.params.token}`); }
+    user.password = hashPassword(password);
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+    req.session.successMsg = 'Password berhasil diubah. Silakan login dengan password baru.';
+    res.redirect('/login');
+  } catch (error) { req.session.errorMsg = 'Gagal mereset password.'; res.redirect(`/reset-password/${req.params.token}`); }
+});
+
+app.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/login'); });
+
+// ================== USER DASHBOARD ==================
+app.get('/dashboard', isAuth, async (req, res) => {
+  if (req.session.userRole === 'admin') return res.redirect('/admin/dashboard');
+  const user = res.locals.user;
+  const totalDeposit = (await Transaction.aggregate([
+    { $match: { userId: user._id, type: 'deposit', status: 'paid' } },
+    { $group: { _id: null, total: { $sum: '$amount' } } }
+  ]))[0]?.total || 0;
+  const totalWithdraw = (await Transaction.aggregate([
+    { $match: { userId: user._id, type: 'withdraw', status: 'success' } },
+    { $group: { _id: null, total: { $sum: '$amount' } } }
+  ]))[0]?.total || 0;
+  const recentTrx = await Transaction.find({ userId: user._id, type: 'deposit' }).sort({ createdAt: -1 }).lean();
+  const apiKeys = await ApiKey.find({ userId: req.session.userId }).lean();
+  res.render('dashboard', { user, totalDeposit, totalWithdraw, recentTrx, apiKeys });
+});
+
+// Profile
+app.get('/profile', isAuth, async (req, res) => {
+  const user = await User.findById(req.session.userId).lean();
+  const apiKeys = await ApiKey.find({ userId: req.session.userId }).lean();
+  res.render('profile', { apiKeys, user });
+});
+
+app.post('/profile', isAuth, async (req, res) => {
+  const { email, newPassword, projectName, callbackUrl, merchantLogoUrl } = req.body;
+  try {
+    const upd = { email };
+    if (newPassword && newPassword.trim()) upd.password = hashPassword(newPassword);
+    if (projectName !== undefined) {
+      let trimmed = projectName.trim();
+      if (trimmed.length > 25) trimmed = trimmed.substring(0, 25);
+      upd.projectName = trimmed;
+    }
+    if (callbackUrl !== undefined) {
+      const trimmedUrl = callbackUrl.trim();
+      if (trimmedUrl === '') {
+        upd.callbackUrl = '';
+      } else {
+        try {
+          const parsed = new URL(trimmedUrl);
+          if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Invalid protocol');
+          upd.callbackUrl = trimmedUrl;
+        } catch (err) {
+          req.session.errorMsg = 'Callback URL tidak valid. Gunakan URL lengkap (https://...).';
+          return res.redirect('/profile');
+        }
+      }
+    }
+    if (merchantLogoUrl !== undefined) {
+      const trimmedLogo = merchantLogoUrl.trim();
+      if (trimmedLogo === '') {
+        upd.merchantLogoUrl = '';
+      } else {
+        try {
+          new URL(trimmedLogo);
+          upd.merchantLogoUrl = trimmedLogo;
+        } catch (err) {
+          req.session.errorMsg = 'URL Logo tidak valid. Gunakan URL lengkap (https://...).';
+          return res.redirect('/profile');
+        }
+      }
+    }
+    await User.findByIdAndUpdate(req.session.userId, upd);
+    req.session.successMsg = 'Profil berhasil diperbarui';
+    res.redirect('/profile');
+  } catch (err) {
+    if (err.code === 11000) req.session.errorMsg = 'Email sudah digunakan oleh pengguna lain';
+    else req.session.errorMsg = 'Gagal memperbarui profil';
+    if (botManager) botManager.notifyError('/profile', err.message);
+    res.redirect('/profile');
+  }
+});
+
+app.post('/api/user/api-key/regenerate', isAuth, async (req, res) => {
+  await ApiKey.deleteMany({ userId: req.session.userId });
+  const key = generateApiKey();
+  try {
+    await createWithRetry(ApiKey, { userId: req.session.userId, key });
+    res.json({ apiKey: key });
+  } catch (err) {
+    if (botManager) botManager.notifyError('/api/user/api-key/regenerate', err.message);
+    res.status(500).json({ error: 'Gagal membuat API key' });
+  }
+});
+
+// ================== DEPOSIT ROUTE ==================
+app.get('/deposit', isAuth, async (req, res) => {
+  const settings = res.locals.settings;
+  const deposits = await Transaction.find({ userId: req.session.userId, type: 'deposit' }).sort({ createdAt: -1 }).lean();
+  res.render('deposit', { deposits, minDeposit: settings.minDeposit });
+});
+
+async function createDepositTransaction(userId, amount, settings) {
+  if (!settings) settings = await getSettings();
+  if (isNaN(amount) || amount < settings.minDeposit) throw new Error(`Minimal deposit adalah Rp ${settings.minDeposit.toLocaleString('id-ID')}`);
+
+  const oneDayAgo = new Date(Date.now() - 30 * 60 * 1000);
+  const lockedTx = await Transaction.find({
+    type: 'deposit',
+    status: { $in: ['pending', 'paid'] },
+    createdAt: { $gte: oneDayAgo }
+  }).select('fee');
+  const usedFees = lockedTx.map(i => Number(i.fee)).filter(f => !isNaN(f));
+
+  const minFee = settings.minFee ?? 0;
+  const maxFee = settings.maxFee ?? 500;
+
+  let availableFees = [];
+  for (let i = minFee; i <= maxFee; i++) {
+    if (!usedFees.includes(i)) availableFees.push(i);
+  }
+
+  if (availableFees.length === 0) {
+    for (let i = maxFee + 1; i <= maxFee + 100; i++) {
+      if (!usedFees.includes(i)) {
+        availableFees.push(i);
+        break;
+      }
+    }
+  }
+
+  if (availableFees.length === 0) throw new Error('Kode unik deposit sedang penuh. Silakan coba lagi beberapa menit.');
+
+  const fee = availableFees[Math.floor(Math.random() * availableFees.length)];
+  const total = amount + fee;
+  const expiredMinutes = settings.qrisExpiredMinutes || 30;
+  const expiredAt = new Date(Date.now() + expiredMinutes * 60 * 1000);
+
+  let qrisImage, trxid;
+  if (settings.paymentGateway === 'orderkuota') {
+    if (!settings.orderkuotaDomain || !settings.orderkuotaApiKey || !settings.orderkuotaUsername || !settings.orderkuotaToken) {
+      throw new Error('Konfigurasi Orderkuota belum lengkap. Hubungi admin.');
+    }
+    const url = `https://${settings.orderkuotaDomain}/?action=createpayment&apikey=${settings.orderkuotaApiKey}&username=${settings.orderkuotaUsername}&amount=${total}&token=${settings.orderkuotaToken}`;
+    try {
+      const resp = await axios.get(url);
+      const data = resp.data;
+      if (!data.status) throw new Error('Gagal membuat QRIS via Orderkuota');
+      qrisImage = data.result.qris_image;
+      trxid = data.result.trxid;
+    } catch (e) {
+      throw new Error('Gagal menghubungi Orderkuota: ' + e.message);
+    }
+  } else {
+    if (!settings.gopayToken || !settings.gopayStaticQr) throw new Error('Konfigurasi Payment Gateway belum lengkap.');
+    const gopayBase = settings.gopayDomain || 'gomerch.vercel.app';
+    const apiUrl = `https://${gopayBase}/api/qris/create?amount=${total}&static_qr=${encodeURIComponent(settings.gopayStaticQr)}`;
+    try {
+      const data = await callGopayApiWithRetry(apiUrl);
+      if (!data.success) throw new Error('Gagal membuat QRIS');
+      qrisImage = data.image_url;
+      trxid = generateCustomId(startId.invoice);
+    } catch (e) { throw e; }
+  }
+
+  const deposit = await createWithRetry(Transaction, {
+    _id: generateCustomId(startId.invoice),
+    userId,
+    type: 'deposit',
+    amount,
+    fee,
+    total,
+    trxid,
+    qris_image: qrisImage,
+    expiredAt,
+    status: 'pending',
+    reference: generateCustomId(startId.invoice)
+  }, 5, () => generateCustomId(startId.invoice));
+
+  return deposit;
+}
+
+app.post('/invoice/create', isAuth, async (req, res) => {
+  try {
+    const amount = parseInt(req.body.amount);
+    const settings = res.locals.settings;
+    const deposit = await createDepositTransaction(req.session.userId, amount, settings);
+    const user = await User.findById(req.session.userId).lean();
+    return res.json({
+      reference: deposit._id.toString(),
+      id: deposit._id.toString(),
+      amount: deposit.amount,
+      fee: deposit.fee,
+      total: deposit.total,
+      qris_image: deposit.qris_image,
+      createdAt: deposit.createdAt,
+      expiredAt: deposit.expiredAt,
+      status: 'pending',
+      callback_url: user.callbackUrl || ''
+    });
+  } catch (e) {
+    console.error('Create invoice error:', e.message);
+    if (botManager) botManager.notifyError('/invoice/create', e.message);
+    return res.status(400).json({ error: e.message });
+  }
+});
+
+// ================== WITHDRAW ROUTES (WEB) ==================
+app.get('/withdraw', isAuth, async (req, res) => {
+  const settings = res.locals.settings;
+  const instantMethods = (settings.instantWithdrawMethods || []).filter(m => m.active);
+  const withdrawals = await Transaction.find({ userId: req.session.userId, type: 'withdraw' }).sort({ createdAt: -1 }).lean();
+  res.render('withdraw', { settings, withdrawals, withdrawMethods: settings.withdrawMethods || [], instantMethods });
+});
+
+app.post('/withdraw/request', isAuth, async (req, res) => {
+  const settings = res.locals.settings;
+  const { amount, methodName, accountNumber } = req.body;
+  if (!methodName || !accountNumber) {
+    req.session.errorMsg = 'Harap lengkapi metode dan nomor tujuan.';
+    return res.redirect('/withdraw');
+  }
+  const amt = parseInt(amount);
+  const selectedMethod = (settings.withdrawMethods || []).find(m => m.name === methodName);
+  if (!selectedMethod) {
+    req.session.errorMsg = 'Metode penarikan tidak valid.';
+    return res.redirect('/withdraw');
+  }
+  if (selectedMethod.min && amt < selectedMethod.min) {
+    req.session.errorMsg = `Minimal penarikan untuk ${selectedMethod.name} adalah Rp ${selectedMethod.min.toLocaleString('id-ID')}`;
+    return res.redirect('/withdraw');
+  }
+  const maxAmount = selectedMethod.max || 1000000;
+  if (amt > maxAmount) {
+    req.session.errorMsg = `Maksimal penarikan untuk ${selectedMethod.name} adalah Rp ${maxAmount.toLocaleString('id-ID')}`;
+    return res.redirect('/withdraw');
+  }
+  const fee = selectedMethod.fee || 0;
+  const totalDeduct = amt + fee;
+  const updatedUser = await User.findOneAndUpdate(
+    { _id: req.session.userId, balance: { $gte: totalDeduct } },
+    { $inc: { balance: -totalDeduct } },
+    { new: true }
+  );
+  if (!updatedUser) {
+    req.session.errorMsg = 'Saldo tidak cukup (termasuk biaya admin Rp ' + fee.toLocaleString('id-ID') + ')';
+    return res.redirect('/withdraw');
+  }
+  try {
+    const ref = 'W' + Date.now().toString(36).toUpperCase();
+    const wd = await createWithRetry(Transaction, {
+      _id: generateCustomId(startId.withdraw),
+      userId: req.session.userId,
+      type: 'withdraw',
+      amount: amt,
+      fee,
+      method: selectedMethod.name,
+      accountNumber,
+      status: 'pending',
+      reference: ref,
+      instant: false
+    }, 5, () => generateCustomId(startId.withdraw));
+
+    const userAfter = await User.findById(req.session.userId);
+    wd.balanceAfter = userAfter.balance;
+    await wd.save();
+
+    if (botManager) {
+      const user = await User.findById(req.session.userId).lean();
+      botManager.notifyWithdrawRequest(wd, user);
+    }
+    req.session.successMsg = 'Penarikan berhasil diajukan dan sedang diproses.';
+  } catch (err) {
+    await User.findByIdAndUpdate(req.session.userId, { $inc: { balance: totalDeduct } });
+    req.session.errorMsg = 'Gagal memproses penarikan. Silakan coba lagi.';
+    console.error(err);
+    if (botManager) botManager.notifyError('/withdraw/request', err.message);
+  }
+  res.redirect('/withdraw');
+});
+
+app.post('/withdraw/instant', isAuth, async (req, res) => {
+  const settings = res.locals.settings;
+  const { amount, methodCode, destination } = req.body;
+  if (!methodCode || !destination || !amount) { req.session.errorMsg = 'Harap lengkapi semua field.'; return res.redirect('/withdraw'); }
+  const amt = parseInt(amount);
+  if (isNaN(amt) || amt <= 0) { req.session.errorMsg = 'Nominal tidak valid.'; return res.redirect('/withdraw'); }
+  const method = (settings.instantWithdrawMethods || []).find(m => m.code === methodCode && m.active);
+  if (!method) { req.session.errorMsg = 'Metode withdraw instan tidak tersedia.'; return res.redirect('/withdraw'); }
+  if (amt < method.minAmount) { 
+    req.session.errorMsg = `Minimal penarikan instan ${method.name} adalah Rp ${method.minAmount.toLocaleString('id-ID')}`; 
+    return res.redirect('/withdraw'); 
+  }
+  const maxInstant = method.maxAmount || 1000000;
+  if (amt > maxInstant) {
+    req.session.errorMsg = `Maksimal penarikan instan ${method.name} adalah Rp ${maxInstant.toLocaleString('id-ID')}`;
+    return res.redirect('/withdraw');
+  }
+  const fee = method.fee || 0;
+  const totalDeduct = amt + fee;
+  if (!settings.h2hIdMerchant || !settings.h2hPin || !settings.h2hPassword) { req.session.errorMsg = 'Fitur withdraw instan belum dikonfigurasi oleh admin.'; return res.redirect('/withdraw'); }
+  const updatedUser = await User.findOneAndUpdate(
+    { _id: req.session.userId, balance: { $gte: totalDeduct } },
+    { $inc: { balance: -totalDeduct } },
+    { new: true }
+  );
+  if (!updatedUser) { req.session.errorMsg = 'Saldo tidak cukup (termasuk biaya admin Rp ' + fee.toLocaleString('id-ID') + ')'; return res.redirect('/withdraw'); }
+  const ref = 'W' + Date.now().toString(36).toUpperCase();
+  const h2hUrl = `https://h2h.okeconnect.com/trx?memberID=${settings.h2hIdMerchant}&product=${method.code}&dest=${destination}&qty=${amt}&refID=${ref}&pin=${settings.h2hPin}&password=${settings.h2hPassword}`;
+  try {
+    await axios.get(h2hUrl, { timeout: 15000 });
+    const wd = await createWithRetry(Transaction, {
+      _id: generateCustomId(startId.withdraw),
+      userId: req.session.userId,
+      type: 'withdraw',
+      amount: amt,
+      fee,
+      method: method.name,
+      methodCode: method.code,
+      accountNumber: destination,
+      instant: true,
+      destination,
+      h2hRefId: ref,
+      status: 'pending'
+    }, 5, () => generateCustomId(startId.withdraw));
+
+    const userAfter = await User.findById(req.session.userId);
+    wd.balanceAfter = userAfter.balance;
+    await wd.save();
+
+    req.session.successMsg = 'Permintaan withdraw instan sedang diproses. Silakan cek status secara berkala.';
+  } catch (err) {
+    await User.findByIdAndUpdate(req.session.userId, { $inc: { balance: totalDeduct } });
+    console.error('Withdraw instan request error:', err.message);
+    req.session.errorMsg = 'Gagal mengirim permintaan withdraw instan. Saldo dikembalikan.';
+    if (botManager) botManager.notifyError('/withdraw/instant (request)', err.message);
+  }
+  res.redirect('/withdraw');
+});
+
+// ================== INSTANT WITHDRAW CHECKER ==================
+async function checkInstantWithdrawals() {
+  try {
+    const settings = await getSettings();
+    if (!settings.h2hIdMerchant) return;
+
+    const pendingInstants = await Transaction.find({
+      type: 'withdraw',
+      instant: true,
+      status: 'pending'
+    });
+
+    for (const wd of pendingInstants) {
+      const h2hUrl = `https://h2h.okeconnect.com/trx?memberID=${settings.h2hIdMerchant}&product=${wd.methodCode}&dest=${wd.destination}&qty=${wd.amount}&refID=${wd.h2hRefId}&pin=${settings.h2hPin}&password=${settings.h2hPassword}&check=1`;
+
+      try {
+        const response = await axios.get(h2hUrl, { timeout: 15000 });
+
+const responseText = (
+  typeof response.data === "string"
+    ? response.data
+    : JSON.stringify(response.data)
+).toLowerCase();
+
+if (responseText.includes("status sukses") || responseText == "ok") {
+  await succeedInstantWithdrawal(wd, "Berhasil Dikirim");
+  continue;
+}
+if (responseText.includes("saldo kamu kurang") || responseText.includes("gagal. ip tidak sesuai") || responseText.includes("tidak ada transaksi tujuan")) {
+  await rejectInstantWithdrawal(wd, "Terjadi kesalahan sistem", responseText);
+  console.log(`Err WD: ${responseText}`)
+  continue;
+}
+if (responseText.includes("nomor hp tidak benar")) {
+  await rejectInstantWithdrawal(wd, "Nomor ewallet tidak valid");
+  continue;
+}
+console.log(`Log WD: ${responseText}`)
+continue;
+
+      } catch (err) {
+        console.error(`Cek status WD instan ${wd._id} gagal:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error("checkInstantWithdrawals error:", err);
+    if (botManager) {
+      botManager.notifyError("checkInstantWithdrawals", err.message);
+    }
+  }
+}
+
+async function succeedInstantWithdrawal(wd, responseText) {
+  wd.status = 'success'; wd.completedAt = new Date(); wd.h2hResponse = responseText; await wd.save();
+  if (botManager) {
+    const user = await User.findById(wd.userId).lean();
+    botManager.notifyInstantWithdraw(wd, user);
+  }
+}
+async function rejectInstantWithdrawal(wd, reason, err) {
+  wd.status = 'rejected'; wd.adminNote = reason; wd.completedAt = new Date();
+  await User.findByIdAndUpdate(wd.userId, { $inc: { balance: wd.amount + wd.fee } });
+  const userAfter = await User.findById(wd.userId);
+  wd.balanceAfter = userAfter.balance;
+  await wd.save();
+  if (botManager) {
+    const user = await User.findById(wd.userId).lean();
+    botManager.notifyInstantWithdraw(wd, user, true, err);
+  }
+}
+
+// ================== MUTASI CHECKER ==================
+let checkerInterval;
+
+async function checkMutasi() {
+  try {
+    const settings = await getSettings();
+    const now = new Date();
+    checkInstantWithdrawals();
+
+    await Transaction.updateMany(
+      { type: 'deposit', status: 'pending', expiredAt: { $lt: now } },
+      { status: 'expired' }
+    );
+
+    await Transaction.deleteMany({
+      type: 'deposit',
+      status: 'expired',
+      expiredAt: { $lt: new Date(Date.now() - 30 * 60 * 1000) }
+    });
+
+    const pendingDeposits = await Transaction.find({ type: 'deposit', status: 'pending' }).lean();
+    const expiredMinutes = settings.qrisExpiredMinutes || 30;
+
+    if (settings.paymentGateway === 'orderkuota') {
+      if (!settings.orderkuotaDomain || !settings.orderkuotaApiKey) return;
+      const mutasiUrl = `https://${settings.orderkuotaDomain}/?action=mutasiqr&apikey=${settings.orderkuotaApiKey}&username=${settings.orderkuotaUsername}&token=${settings.orderkuotaToken}`;
+      try {
+        const resp = await axios.get(mutasiUrl);
+        const data = resp.data;
+        if (!data.status || !data.result?.success || !Array.isArray(data.result.results)) return;
+        const results = data.result.results;
+        const usedMutationIds = await Transaction.find({ type: 'deposit', mutationId: { $ne: null } }).distinct('mutationId');
+        const availableMutations = results.filter(tx => tx.status === 'IN' && !usedMutationIds.includes(String(tx.id)));
+
+        for (const dep of pendingDeposits) {
+          const matched = availableMutations.find(tx => {
+            const nominal = parseInt(String(tx.kredit).replace(/\./g, ''));
+            if (nominal !== dep.total) return false;
+            const rawDateString = tx.tanggal || tx.created_at || tx.createdAt || tx.date || tx.datetime || tx.tanggal;
+            if (!rawDateString) return false;
+            let mutationTime;
+            if (rawDateString.includes('/')) {
+              const [datePart, timePart] = rawDateString.split(' ');
+              const [day, month, year] = datePart.split('/');
+              mutationTime = new Date(`${year}-${month}-${day}T${timePart}+07:00`);
+            } else {
+              mutationTime = new Date(rawDateString);
+            }
+            if (isNaN(mutationTime.getTime())) return false;
+            const diffMinutes = Math.abs(mutationTime.getTime() - dep.createdAt.getTime()) / 1000 / 60;
+            return diffMinutes <= expiredMinutes;
+          });
+          if (!matched) continue;
+
+          await Transaction.findByIdAndUpdate(dep._id, { status: 'paid', mutationId: String(matched.id), completedAt: new Date() });
+          await User.findByIdAndUpdate(dep.userId, { $inc: { balance: dep.amount } });
+          const updatedUser = await User.findById(dep.userId);
+          await Transaction.findByIdAndUpdate(dep._id, { balanceAfter: updatedUser.balance });
+
+          if (botManager) { const user = await User.findById(dep.userId).lean(); if (user) botManager.notifyDeposit(dep, user); }
+          const idx = availableMutations.findIndex(tx => String(tx.id) === String(matched.id));
+          if (idx !== -1) availableMutations.splice(idx, 1);
+        }
+      } catch (err) {
+        console.error('Orderkuota Mutasi error:', err.message);
+        if (botManager) botManager.notifyError('checkMutasi (orderkuota)', err.message);
+      }
+    } else {
+      if (!settings.gopayToken) return;
+      const gopayBase = settings.gopayDomain || 'gomerch.vercel.app';
+      const apiUrl = `https://${gopayBase}/api/history?token=${encodeURIComponent(settings.gopayToken)}`;
+      try {
+        const data = await callGopayApiWithRetry(apiUrl);
+        if (!data.success || !Array.isArray(data.data)) return;
+        const mutations = data.data.filter(tx => tx.status === 'success');
+        const usedMutationIds = await Transaction.find({ type: 'deposit', mutationId: { $ne: null } }).distinct('mutationId');
+        const availableMutations = mutations.filter(tx => !usedMutationIds.includes(String(tx.id)));
+        for (const dep of pendingDeposits) {
+          const match = availableMutations.find(tx => {
+            if (tx.amount !== dep.total) return false;
+            const txTime = new Date(tx.time);
+            if (isNaN(txTime.getTime())) return false;
+            const diffMinutes = Math.abs(txTime.getTime() - dep.createdAt.getTime()) / 1000 / 60;
+            return diffMinutes <= expiredMinutes;
+          });
+          if (!match) continue;
+          await Transaction.findByIdAndUpdate(dep._id, { status: 'paid', mutationId: String(match.id), completedAt: new Date() });
+          await User.findByIdAndUpdate(dep.userId, { $inc: { balance: dep.amount } });
+          const updatedUser = await User.findById(dep.userId);
+          await Transaction.findByIdAndUpdate(dep._id, { balanceAfter: updatedUser.balance });
+          if (botManager) { const user = await User.findById(dep.userId).lean(); if (user) botManager.notifyDeposit(dep, user); }
+          const idx = availableMutations.findIndex(tx => String(tx.id) === String(match.id));
+          if (idx !== -1) availableMutations.splice(idx, 1);
+        }
+      } catch (err) { console.error('Mutasi error:', err.response?.data || err.message); if (botManager) botManager.notifyError('checkMutasi', err.response?.data?.error || err.message); }
+    }
+  } catch (err) { console.error('Mutasi error:', err.response?.data || err.message); if (botManager) botManager.notifyError('checkMutasi global', err.message); }
+}
+
+async function updateStatsOnStartup() {
+  const [depositAgg, withdrawAgg, totalUsers, totalTrx, balanceAgg] = await Promise.all([
+    Transaction.aggregate([{ $match: { type: 'deposit', status: 'paid' } }, { $group: { _id: null, totalAmount: { $sum: '$amount' }, totalFee: { $sum: '$fee' } } }]),
+    Transaction.aggregate([{ $match: { type: 'withdraw', status: 'success' } }, { $group: { _id: null, totalAmount: { $sum: '$amount' }, totalFee: { $sum: '$fee' } } }]),
+    User.countDocuments({ role: 'user' }),
+    Transaction.countDocuments(),
+    User.aggregate([{ $match: { role: 'user' } }, { $group: { _id: null, totalBalance: { $sum: '$balance' } } }])
+  ]);
+  await Stats.deleteMany({});
+  await Stats.create({
+    totalDepositAmount: depositAgg[0]?.totalAmount || 0,
+    totalDepositFee: depositAgg[0]?.totalFee || 0,
+    totalWithdrawAmount: withdrawAgg[0]?.totalAmount || 0,
+    totalWithdrawFee: withdrawAgg[0]?.totalFee || 0,
+    totalUsers,
+    totalTransactions: totalTrx,
+    totalUserBalance: balanceAgg[0]?.totalBalance || 0
+  });
+}
+
+function startChecker() {
+  if (checkerInterval) clearInterval(checkerInterval);
+  getSettings().then(s => { checkerInterval = setInterval(checkMutasi, s.checkInterval * 1000); checkMutasi(); });
+}
+setTimeout(async () => { await updateStatsOnStartup(); startChecker(); }, 2000);
+
+// ================== PUBLIC PAYMENT PAGE ==================
+app.get('/payment/:id', async (req, res) => {
+  try {
+    const transaction = await Transaction.findById(req.params.id).populate('userId', 'username projectName callbackUrl merchantLogoUrl');
+    if (!transaction || transaction.type !== 'deposit') return res.status(404).send('Invoice tidak ditemukan');
+    const settings = await getSettings();
+    res.render('payment', {
+      invoice: transaction,
+      settings,
+      projectName: transaction.userId?.projectName || '',
+      callbackUrl: transaction.userId?.callbackUrl || '',
+      merchantLogoUrl: transaction.userId?.merchantLogoUrl || ''
+    });
+  } catch (err) {
+    console.error('Payment page error:', err);
+    res.status(500).send('Terjadi kesalahan server');
+  }
+});
+
+app.get('/payment/status/:id', async (req, res) => {
+  try {
+    const transaction = await Transaction.findById(req.params.id);
+    if (!transaction) return res.status(404).json({ error: 'Invoice tidak ditemukan' });
+    res.json({ status: transaction.status });
+  } catch (err) {
+    console.error('Payment status error:', err);
+    res.status(500).json({ error: 'Terjadi kesalahan server' });
+  }
+});
+
+// ================== ADMIN ROUTES ==================
+app.get('/admin/dashboard', isAuth, isAdmin, async (req, res) => {
+  const stats = await computeStats();
+  const withdrawals = await Transaction.find({ type: 'withdraw', instant: false }).populate('userId', 'username email').sort({ createdAt: -1 }).lean();
+  res.render('admin_dashboard', { stats, withdrawals });
+});
+
+app.get('/admin/users', isAuth, isAdmin, async (req, res) => {
+  const search = req.query.search || '';
+  const filter = { role: 'user' };
+  if (search) filter.$or = [{ email: { $regex: search, $options: 'i' } }, { username: { $regex: search, $options: 'i' } }];
+  const users = await User.find(filter).sort({ balance: -1 }).lean();
+  res.render('admin_users', { users, search });
+});
+
+app.get('/admin/users/:id/edit', isAuth, isAdmin, async (req, res) => {
+  const targetUser = await User.findById(req.params.id).lean();
+  if (!targetUser) return res.status(404).send('Tidak ditemukan');
+  res.render('admin_user_edit', { users: targetUser });
+});
+
+app.post('/admin/users/:id/edit', isAuth, isAdmin, async (req, res) => {
+  const { username, email, password, balance, suspended, projectName, callbackUrl, merchantLogoUrl } = req.body;
+
+  if (username) {
+    if (!/^[a-zA-Z0-9]+$/.test(username)) { req.session.errorMsg = 'Username hanya boleh berisi huruf dan angka (tanpa spasi atau simbol)'; return res.redirect(`/admin/users/${req.params.id}/edit`); }
+    if (username.length > 15) { req.session.errorMsg = 'Username maksimal 15 karakter'; return res.redirect(`/admin/users/${req.params.id}/edit`); }
+  }
+
+  let finalProjectName = '';
+  if (projectName !== undefined) {
+    let trimmed = projectName.trim();
+    if (trimmed.length > 25) trimmed = trimmed.substring(0, 25);
+    finalProjectName = trimmed;
+  }
+
+  let finalCallbackUrl = '';
+  if (callbackUrl !== undefined) {
+    const trimmedUrl = callbackUrl.trim();
+    if (trimmedUrl === '') {
+      finalCallbackUrl = '';
+    } else {
+      try {
+        const parsed = new URL(trimmedUrl);
+        if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Invalid protocol');
+        finalCallbackUrl = trimmedUrl;
+      } catch (err) {
+        req.session.errorMsg = 'Callback URL tidak valid. Gunakan URL lengkap (https://...).';
+        return res.redirect(`/admin/users/${req.params.id}/edit`);
+      }
+    }
+  }
+
+  let finalMerchantLogoUrl = '';
+  if (merchantLogoUrl !== undefined) {
+    const trimmedLogo = merchantLogoUrl.trim();
+    if (trimmedLogo === '') {
+      finalMerchantLogoUrl = '';
+    } else {
+      try {
+        new URL(trimmedLogo);
+        finalMerchantLogoUrl = trimmedLogo;
+      } catch (err) {
+        req.session.errorMsg = 'URL Logo tidak valid. Gunakan URL lengkap (https://...).';
+        return res.redirect(`/admin/users/${req.params.id}/edit`);
+      }
+    }
+  }
+
+  const upd = {
+    username: username?.toLowerCase(),
+    email,
+    balance: parseInt(balance) || 0,
+    suspended: suspended === 'on',
+    projectName: finalProjectName,
+    callbackUrl: finalCallbackUrl,
+    merchantLogoUrl: finalMerchantLogoUrl
+  };
+  if (!upd.username) delete upd.username;
+  if (password && password.trim()) upd.password = hashPassword(password);
+  try {
+    await User.findByIdAndUpdate(req.params.id, upd, { runValidators: true });
+    req.session.successMsg = 'Data pengguna berhasil diperbarui';
+    res.redirect('/admin/users');
+  } catch (err) {
+    if (err.code === 11000) req.session.errorMsg = 'Username atau email sudah digunakan oleh pengguna lain';
+    else if (err.name === 'ValidationError') req.session.errorMsg = Object.values(err.errors).map(e => e.message).join(', ');
+    else req.session.errorMsg = 'Gagal memperbarui data pengguna';
+    if (botManager) botManager.notifyError('/admin/users/edit', err.message);
+    res.redirect(`/admin/users/${req.params.id}/edit`);
+  }
+});
+
+app.post('/admin/users/:id/delete', isAuth, isAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const userToDelete = await User.findById(userId);
+    if (!userToDelete) { req.session.errorMsg = 'User tidak ditemukan.'; return res.redirect('/admin/users'); }
+    if (userToDelete.role === 'admin') { req.session.errorMsg = 'Tidak dapat menghapus akun admin.'; return res.redirect('/admin/users'); }
+    await Transaction.deleteMany({ userId });
+    await ApiKey.deleteMany({ userId });
+    await User.findByIdAndDelete(userId);
+    req.session.successMsg = 'User berhasil dihapus beserta seluruh data terkait.';
+    res.redirect('/admin/users');
+  } catch (err) { console.error(err); if (botManager) botManager.notifyError('/admin/users/delete', err.message); req.session.errorMsg = 'Gagal menghapus user.'; res.redirect('/admin/users'); }
+});
+
+app.post('/admin/transactions/:id/edit', isAuth, isAdmin, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!status) return res.status(400).json({ success: false, error: 'Status baru diperlukan.' });
+
+    const transaction = await Transaction.findById(req.params.id);
+    if (!transaction || transaction.type !== 'deposit')
+      return res.status(404).json({ success: false, error: 'Transaksi deposit tidak ditemukan.' });
+
+    const prevStatus = transaction.status;
+    const allowedMap = {
+      pending: ['paid', 'expired'],
+      paid: ['expired'],
+      expired: ['paid']
+    };
+    const allowedStatuses = allowedMap[prevStatus] || [];
+    if (!allowedStatuses.includes(status))
+      return res.status(400).json({ success: false, error: 'Perubahan status tidak diizinkan.' });
+
+    const userId = transaction.userId;
+    const amount = transaction.amount;
+    if (status === 'paid') {
+      if (prevStatus !== 'paid') {
+        await User.findByIdAndUpdate(userId, { $inc: { balance: amount } });
+        const userAfter = await User.findById(userId);
+        transaction.balanceAfter = userAfter.balance;
+      }
+      transaction.completedAt = new Date();
+    } else if (status === 'expired') {
+      if (prevStatus === 'paid') {
+        await User.findByIdAndUpdate(userId, { $inc: { balance: -amount } });
+        const userAfter = await User.findById(userId);
+        transaction.balanceAfter = userAfter.balance;
+      }
+    }
+
+    transaction.status = status;
+    await transaction.save();
+    if (status === 'paid' && botManager) {
+      const user = await User.findById(userId).lean();
+      if (user) {
+        await botManager.notifyDeposit(transaction, user);
+      }
+    }
+
+    return res.json({ success: true, message: `Status berhasil diubah menjadi ${status}.` });
+  } catch (err) {
+    console.error('Edit deposit status error:', err);
+    if (botManager) botManager.notifyError('/admin/transactions/edit', err.message);
+    return res.status(500).json({ success: false, error: 'Terjadi kesalahan server.' });
+  }
+});
+
+app.get('/admin/withdraw', isAuth, isAdmin, async (req, res) => {
+  const search = req.query.search || '';
+  let filter = { type: 'withdraw', instant: false };
+  if (search) {
+    const users = await User.find({ $or: [{ email: { $regex: search, $options: 'i' } }, { username: { $regex: search, $options: 'i' } }] }).select('_id');
+    filter.userId = { $in: users.map(u => u._id) };
+  }
+  const withdrawals = await Transaction.find(filter).populate('userId', 'username email').sort({ createdAt: -1 }).lean();
+  res.render('admin_withdraw', { withdrawals, search });
+});
+
+app.post('/admin/withdraw/success/:id', isAuth, isAdmin, async (req, res) => {
+  const trx = await Transaction.findOne({ _id: req.params.id, type: 'withdraw' });
+  if (trx && trx.status === 'pending' && !trx.instant) {
+    trx.status = 'success'; trx.completedAt = new Date(); await trx.save();
+    req.session.successMsg = 'Penarikan berhasil disetujui.';
+    if (botManager) {
+      const user = await User.findById(trx.userId).lean();
+      if (user) {
+        botManager.notifyWithdrawSuccessToChannel(trx, user);
+        sendWebhook(user, 'withdraw.success', { withdraw_id: trx._id, amount: trx.amount, fee: trx.fee, method: trx.method, account_number: trx.accountNumber, status: 'success', balance_after: trx.balanceAfter || user.balance });
+      }
+    }
+  }
+  res.redirect('/admin/withdraw');
+});
+
+app.post('/admin/withdraw/reject/:id', isAuth, isAdmin, async (req, res) => {
+  const trx = await Transaction.findOne({ _id: req.params.id, type: 'withdraw' });
+  if (trx && trx.status === 'pending' && !trx.instant) {
+    trx.status = 'rejected'; trx.adminNote = req.body.note || ''; trx.completedAt = new Date();
+    await User.findByIdAndUpdate(trx.userId, { $inc: { balance: trx.amount + trx.fee } });
+    const userAfter = await User.findById(trx.userId);
+    trx.balanceAfter = userAfter.balance;
+    await trx.save();
+    req.session.successMsg = 'Penarikan ditolak dan saldo dikembalikan.';
+    const user = await User.findById(trx.userId).lean();
+    if (user) sendWebhook(user, 'withdraw.rejected', { withdraw_id: trx._id, amount: trx.amount, fee: trx.fee, method: trx.method, reason: req.body.note || '', status: 'rejected', balance_after: trx.balanceAfter || user.balance });
+  }
+  res.redirect('/admin/withdraw');
+});
+
+app.get('/admin/transactions', isAuth, isAdmin, async (req, res) => {
+  const search = req.query.search || '';
+  let filter = {};
+  if (search) {
+    const users = await User.find({ $or: [{ email: { $regex: search, $options: 'i' } }, { username: { $regex: search, $options: 'i' } }] }).select('_id');
+    filter = { $or: [{ userId: { $in: users.map(u => u._id) } }, { reference: { $regex: search, $options: 'i' } }] };
+  }
+  const transactions = await Transaction.find(filter).populate('userId', 'username email').sort({ createdAt: -1 }).lean();
+  res.render('admin_transactions', { transactions, search });
+});
+
+app.get('/admin/account', isAuth, isAdmin, async (req, res) => {
+  const admin = await User.findById(req.session.userId).lean();
+  res.render('admin_account', { admin });
+});
+
+app.post('/admin/account', isAuth, isAdmin, async (req, res) => {
+  const { username, password, newPassword } = req.body;
+  const admin = await User.findById(req.session.userId).lean();
+  if (!password || !verifyPassword(password, admin.password)) { req.session.errorMsg = 'Password saat ini salah'; return res.redirect('/admin/account'); }
+  if (username && username !== admin.username) {
+    if (!/^[a-zA-Z0-9]+$/.test(username)) { req.session.errorMsg = 'Username hanya boleh berisi huruf dan angka (tanpa spasi atau simbol)'; return res.redirect('/admin/account'); }
+    if (username.length > 15) { req.session.errorMsg = 'Username maksimal 15 karakter'; return res.redirect('/admin/account'); }
+    const exist = await User.findOne({ username: username.toLowerCase(), _id: { $ne: admin._id } });
+    if (exist) { req.session.errorMsg = 'Username sudah digunakan oleh pengguna lain'; return res.redirect('/admin/account'); }
+  }
+  try {
+    const update = {};
+    if (username && username !== admin.username) update.username = username.toLowerCase();
+    if (newPassword && newPassword.trim()) update.password = hashPassword(newPassword);
+    if (Object.keys(update).length > 0) { await User.findByIdAndUpdate(req.session.userId, update); req.session.successMsg = 'Data akun berhasil diperbarui'; }
+    else req.session.errorMsg = 'Tidak ada perubahan yang dilakukan';
+  } catch (e) { if (botManager) botManager.notifyError('/admin/account', e.message); req.session.errorMsg = 'Gagal memperbarui akun'; }
+  res.redirect('/admin/account');
+});
+
+app.post('/admin/settings/withdraw-methods', isAuth, isAdmin, async (req, res) => {
+  try {
+    const { withdrawMethods } = req.body;
+    if (!Array.isArray(withdrawMethods) || withdrawMethods.length === 0) return res.status(400).json({ success: false, error: 'Data tidak valid' });
+    const cleaned = withdrawMethods
+      .filter(m => m.name && typeof m.name === 'string' && m.name.trim() !== '')
+      .map(m => ({
+        name: m.name.trim(),
+        fee: typeof m.fee === 'number' && !isNaN(m.fee) ? m.fee : 0,
+        min: typeof m.min === 'number' && !isNaN(m.min) && m.min > 0 ? m.min : 0,
+        max: typeof m.max === 'number' && !isNaN(m.max) && m.max > 0 ? m.max : 1000000
+      }));
+    if (cleaned.length === 0) return res.status(400).json({ success: false, error: 'Minimal satu metode harus valid' });
+    await Setting.updateOne({}, { withdrawMethods: cleaned });
+    return res.json({ success: true });
+  } catch (err) { console.error(err); if (botManager) botManager.notifyError('/admin/settings/withdraw-methods', err.message); return res.status(500).json({ success: false, error: 'Gagal menyimpan metode withdraw' }); }
+});
+
+app.post('/admin/settings/reset', isAuth, isAdmin, async (req, res) => {
+  try {
+    await User.deleteMany({ role: 'user' });
+    await Transaction.deleteMany({});
+    await ApiKey.deleteMany({});
+    await Stats.deleteMany({});
+    await Stats.create({ totalDepositAmount: 0, totalDepositFee: 0, totalWithdrawAmount: 0, totalWithdrawFee: 0, totalUsers: 0, totalTransactions: 0, totalUserBalance: 0 });
+    req.session.successMsg = 'Database berhasil direset. Semua data pengguna dan transaksi telah dihapus.';
+  } catch (error) { console.error('Reset database error:', error); if (botManager) botManager.notifyError('/admin/settings/reset', error.message); req.session.errorMsg = 'Gagal mereset database. Silakan coba lagi.'; }
+  res.redirect('/admin/settings');
+});
+
+app.post('/admin/settings/toggle-bot', isAuth, isAdmin, async (req, res) => {
+  try {
+    const settings = await Setting.findOne();
+    if (!settings.telegramBotToken || !settings.telegramOwnerId) return res.json({ success: false, error: 'Token Bot atau Owner ID belum diisi.' });
+    const newStatus = !settings.telegramBotEnabled;
+    settings.telegramBotEnabled = newStatus;
+    await settings.save();
+    if (botManager) await botManager.updateSettings(settings);
+    const botRunning = botManager ? botManager.isRunning() : false;
+    return res.json({ success: true, botRunning, message: botRunning ? 'Bot berhasil disambungkan.' : 'Bot berhasil diputuskan.' });
+  } catch (err) { console.error('Toggle bot error:', err); if (botManager) botManager.notifyError('/admin/settings/toggle-bot', err.message); return res.json({ success: false, error: 'Gagal mengubah status bot.' }); }
+});
+
+app.post('/admin/settings/restart-bot', isAuth, isAdmin, async (req, res) => {
+  try {
+    if (!botManager) return res.status(500).json({ success: false, message: 'Bot Manager belum diinisialisasi. Harap tunggu beberapa saat.' });
+    await botManager.restartBot();
+    return res.json({ success: true, message: '✅ Bot Telegram berhasil direstart.' });
+  } catch (err) {
+    console.error('Gagal restart bot:', err);
+    return res.status(500).json({ success: false, message: '❌ Gagal merestart bot: ' + err.message });
+  }
+});
+
+app.get('/admin/settings', isAuth, isAdmin, async (req, res) => {
+  const settings = await getSettings();
+  const botStatus = botManager ? (botManager.isRunning() ? 'Running' : 'Stopped') : 'Not initialized';
+  res.render('admin_settings', { settings, botStatus });
+});
+
+app.post('/admin/settings/instant-withdraw-methods', isAuth, isAdmin, async (req, res) => {
+  try {
+    const { instantWithdrawMethods } = req.body;
+    if (!Array.isArray(instantWithdrawMethods)) return res.status(400).json({ success: false, error: 'Data tidak valid' });
+    const cleaned = instantWithdrawMethods.map(m => ({
+      name: m.name || '', code: m.code || '', fee: parseInt(m.fee) || 0,
+      minAmount: parseInt(m.minAmount) || 10000, maxAmount: parseInt(m.maxAmount) || 1000000,
+      active: m.active === true || m.active === 'true' || m.active === 'on'
+    })).filter(m => m.name.trim() !== '' && m.code.trim() !== '');
+    await Setting.updateOne({}, { instantWithdrawMethods: cleaned });
+    return res.json({ success: true });
+  } catch (err) { console.error(err); if (botManager) botManager.notifyError('/admin/settings/instant-withdraw-methods', err.message); return res.status(500).json({ success: false, error: 'Gagal menyimpan metode instan' }); }
+});
+
+app.post('/admin/settings', isAuth, isAdmin, (req, res, next) => {
+  logoUpload.single('logo')(req, res, function(err) {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') req.session.errorMsg = 'Ukuran file logo maksimal 2MB.';
+      else if (err.message) req.session.errorMsg = 'Gagal upload logo: ' + err.message;
+      else req.session.errorMsg = 'Gagal upload logo.';
+      if (botManager) botManager.notifyError('/admin/settings (logo upload)', err.message);
+      return res.redirect('/admin/settings');
+    }
+    next();
+  });
+}, async (req, res) => {
+  let withdrawMethods = [];
+  const raw = req.body.withdrawMethodsJson;
+  if (raw) {
+    try { withdrawMethods = JSON.parse(raw); if (!Array.isArray(withdrawMethods)) withdrawMethods = []; } catch (e) { withdrawMethods = []; }
+  }
+  withdrawMethods = withdrawMethods
+    .filter(m => m.name && typeof m.name === 'string' && m.name.trim() !== '')
+    .map(m => ({
+      name: m.name.trim(),
+      fee: typeof m.fee === 'number' && !isNaN(m.fee) ? m.fee : 0,
+      min: typeof m.min === 'number' && !isNaN(m.min) && m.min > 0 ? m.min : 0,
+      max: typeof m.max === 'number' && !isNaN(m.max) && m.max > 0 ? m.max : 1000000
+    }));
+  if (withdrawMethods.length === 0) withdrawMethods = [
+    { name: 'Dana', fee: 1000, min: 10000, max: 1000000 },
+    { name: 'GoPay', fee: 2000, min: 10000, max: 1000000 }
+  ];
+
+  let instantWithdrawMethods = [];
+  const instantRaw = req.body.instantWithdrawMethodsJson;
+  if (instantRaw) {
+    try { instantWithdrawMethods = JSON.parse(instantRaw); if (!Array.isArray(instantWithdrawMethods)) instantWithdrawMethods = []; } catch (e) { instantWithdrawMethods = []; }
+  }
+  instantWithdrawMethods = instantWithdrawMethods.map(m => ({
+    name: m.name || '', code: m.code || '', fee: parseInt(m.fee) || 0,
+    minAmount: parseInt(m.minAmount) || 10000, maxAmount: parseInt(m.maxAmount) || 1000000,
+    active: m.active === true || m.active === 'true' || m.active === 'on'
+  })).filter(m => m.name.trim() !== '' && m.code.trim() !== '');
+  if (instantWithdrawMethods.length === 0) instantWithdrawMethods = [
+    { name: 'Dana', code: 'BBSD', fee: 1000, minAmount: 10000, maxAmount: 1000000, active: true },
+    { name: 'GoPay', code: 'BBSGOP', fee: 2000, minAmount: 10000, maxAmount: 1000000, active: true }
+  ];
+
+  const parseNumber = (val, def) => { const n = parseInt(val); return isNaN(n) ? def : n; };
+  const {
+    name, title, description, channelInformation, contactDeveloper, minDeposit, minWithdraw, maxFee, minFee,
+    checkInterval, smtpUser, smtpPass, qrisExpiredMinutes,
+    gopayDomain, gopayToken, gopayStaticQr, gopayRefreshToken,
+    paymentGateway,
+    orderkuotaDomain, orderkuotaApiKey, orderkuotaUsername, orderkuotaToken,
+    telegramBotToken, telegramOwnerId, telegramBotEnabled,
+    h2hIdMerchant, h2hPin, h2hPassword
+  } = req.body;
+
+  let logoUrl = req.body.existingLogoUrl || '';
+  if (req.file) {
+    if (logoUrl && logoUrl.startsWith('/')) {
+      const oldPath = path.join(__dirname, 'public', logoUrl);
+      if (fs.existsSync(oldPath)) try { fs.unlinkSync(oldPath); } catch (e) { console.error('Gagal menghapus logo lama:', e); }
+    }
+    logoUrl = '/' + req.file.filename;
+  }
+
+  try {
+    await Setting.updateOne({}, {
+      name, title, description, channelInformation, contactDeveloper,
+      minDeposit: parseNumber(minDeposit, 1000), minWithdraw: parseNumber(minWithdraw, 5000),
+      minFee: parseNumber(minFee, 0),
+      maxFee: parseNumber(maxFee, 500),
+      checkInterval: parseNumber(checkInterval, 30), smtpUser, smtpPass,
+      logoUrl, qrisExpiredMinutes: parseNumber(qrisExpiredMinutes, 30),
+      withdrawMethods,
+      gopayDomain: gopayDomain || 'gomerch.vercel.app', gopayToken: gopayToken || '',
+      gopayStaticQr: gopayStaticQr || '', gopayRefreshToken: gopayRefreshToken || '',
+      paymentGateway: paymentGateway || 'gopaymerchant',
+      orderkuotaDomain: orderkuotaDomain || '',
+      orderkuotaApiKey: orderkuotaApiKey || '',
+      orderkuotaUsername: orderkuotaUsername || '',
+      orderkuotaToken: orderkuotaToken || '',
+      telegramBotToken: telegramBotToken || '', telegramOwnerId: telegramOwnerId || '',
+      telegramBotEnabled: telegramBotEnabled === 'on' || telegramBotEnabled === true,
+      h2hIdMerchant: h2hIdMerchant || '', h2hPin: h2hPin || '', h2hPassword: h2hPassword || '',
+      instantWithdrawMethods
+    });
+    const updatedSettings = await Setting.findOne();
+    if (botManager) await botManager.updateSettings(updatedSettings);
+    startChecker();
+    req.session.successMsg = 'Pengaturan berhasil diperbarui.';
+  } catch (err) { console.error('Gagal menyimpan pengaturan:', err); if (botManager) botManager.notifyError('/admin/settings (save)', err.message); req.session.errorMsg = 'Gagal menyimpan pengaturan.'; }
+  res.redirect('/admin/settings');
+});
+
+// ================== PUBLIC API / DOCS ==================
+app.get('/docs', async (req, res) => {
+  let userApiKey = '';
+  if (req.session.userId) { const key = await ApiKey.findOne({ userId: req.session.userId }); if (key) userApiKey = key.key; }
+  res.render('docs', { userApiKey });
+});
+
+app.get('/privacy-policy', async (req, res) => res.render('privacy_policy'));
+app.get('/terms-of-service', async (req, res) => res.render('terms_of_service'));
+
+// ================== API AUTH MIDDLEWARE ==================
+async function apiAuth(req, res, next) {
+  const apiKey = req.headers['x-api-key'] || req.query.api_key || req.query.apikey;
+  if (!apiKey) return res.status(401).json({ error: 'API key diperlukan' });
+  const keyDoc = await ApiKey.findOne({ key: apiKey });
+  if (!keyDoc) return res.status(401).json({ error: 'API key tidak valid' });
+  req.apiUser = keyDoc.userId;
+  next();
+}
+
+// ================== API ROUTES ==================
+app.get('/api/balance', ApiLimiter, apiAuth, async (req, res) => {
+  const user = await User.findById(req.apiUser);
+  if (!user) return res.status(404).json({ error: 'User tidak ditemukan' });
+  res.json({ username: user.username, email: user.email, balance: user.balance });
+});
+
+app.get('/api/invoice', ApiLimiter, apiAuth, async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const amount = parseInt(req.query.amount);
+    if (isNaN(amount) || amount < settings.minDeposit || amount > 1_000_000) {
+      const message = isNaN(amount)
+        ? 'Jumlah deposit tidak valid'
+        : amount < settings.minDeposit
+          ? `Minimal deposit Rp ${settings.minDeposit.toLocaleString('id-ID')}`
+          : 'Maksimal deposit Rp 1.000.000';
+      return res.status(400).json({ error: message });
+    }
+    const deposit = await createDepositTransaction(req.apiUser, amount, settings);
+    const user = await User.findById(req.apiUser).lean();
+    const payment_link = `${req.protocol}://${req.get('host')}/payment/${deposit._id}`;
+    return res.json({
+      success: true,
+      invoice_id: deposit._id,
+      amount: deposit.amount,
+      fee: deposit.fee,
+      total: deposit.total,
+      qris_image: deposit.qris_image,
+      payment_link,
+      expired_at: deposit.expiredAt,
+      callback_url: user.callbackUrl || ''
+    });
+  } catch (e) { console.error('API create invoice error:', e.message); if (botManager) botManager.notifyError('/api/invoice', e.message); return res.status(400).json({ error: e.message }); }
+});
+
+app.get('/api/invoice/status', ApiLimiter, apiAuth, async (req, res) => {
+  const invoiceId = req.query.id || req.query.invoice_id;
+  if (!invoiceId) return res.status(400).json({ error: 'Invoice ID diperlukan' });
+  const deposit = await Transaction.findOne({ _id: invoiceId, type: 'deposit' });
+  if (!deposit || deposit.userId.toString() !== req.apiUser.toString()) return res.status(404).json({ error: 'Invoice tidak ditemukan' });
+  const payment_link = `${req.protocol}://${req.get('host')}/payment/${deposit._id}`;
+
+  const response = {
+    invoice_id: deposit._id,
+    amount: deposit.amount,
+    fee: deposit.fee,
+    total: deposit.total,
+    status: deposit.status,
+    qris_image: deposit.qris_image,
+    payment_link,
+    expired_at: deposit.expiredAt,
+    created_at: deposit.createdAt
+  };
+
+  if (deposit.status === 'paid' || deposit.status === 'success') {
+    response.balance_after = deposit.balanceAfter || null;
+    response.completed_at = deposit.completedAt;
+  }
+
+  res.json(response);
+});
+
+// ================== API WITHDRAW ENDPOINTS ==================
+app.get('/api/withdraw/methods', ApiLimiter, apiAuth, async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const manual = (settings.withdrawMethods || []).map(m => ({
+      name: m.name,
+      method: m.name.toLowerCase(),
+      fee: m.fee,
+      min: m.min,
+      max: m.max || 1000000
+    }));
+    const instant = (settings.instantWithdrawMethods || [])
+      .filter(m => m.active)
+      .map(m => ({
+        name: m.name,
+        method: m.name.toLowerCase(),
+        fee: m.fee,
+        min: m.minAmount,
+        max: m.maxAmount || 1000000
+      }));
+    res.json({ manual_methods: manual, instant_methods: instant });
+  } catch (e) {
+    console.error(e);
+    if (botManager) botManager.notifyError('/api/withdraw/methods', e.message);
+    res.status(500).json({ error: 'Gagal memuat metode withdraw' });
+  }
+});
+
+app.get('/api/withdraw', ApiLimiter, apiAuth, async (req, res) => {
+  try {
+    const settings = await getSettings();
+    const { amount, method, account_number, instant } = req.query;
+
+    if (!amount || !method) return res.status(400).json({ error: 'amount dan method diperlukan' });
+
+    const amt = parseInt(amount);
+    if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: 'amount tidak valid' });
+
+    const isInstant = instant == true || instant == 'true';
+    const userId = req.apiUser;
+
+    if (isInstant) {
+      if (!account_number) return res.status(400).json({ error: 'account_number diperlukan untuk instant withdrawal' });
+
+      const methodLower = method.toLowerCase();
+      const instantMethod = (settings.instantWithdrawMethods || []).find(
+        m => m.name.toLowerCase() === methodLower && m.active
+      );
+
+      if (!instantMethod) return res.status(400).json({ error: 'Metode instant withdrawal tidak tersedia atau tidak aktif' });
+      if (amt < instantMethod.minAmount) return res.status(400).json({ error: `Minimal penarikan instan ${instantMethod.name} adalah Rp ${instantMethod.minAmount}` });
+      const maxInstant = instantMethod.maxAmount || 1000000;
+      if (amt > maxInstant) return res.status(400).json({ error: `Maksimal penarikan instan ${instantMethod.name} adalah Rp ${maxInstant}` });
+
+      if (!settings.h2hIdMerchant || !settings.h2hPin || !settings.h2hPassword) {
+        return res.status(400).json({ error: 'Fitur instant withdrawal belum dikonfigurasi oleh admin.' });
+      }
+
+      const fee = instantMethod.fee || 0;
+      const totalDeduct = amt + fee;
+
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: userId, balance: { $gte: totalDeduct } },
+        { $inc: { balance: -totalDeduct } },
+        { new: true }
+      );
+
+      if (!updatedUser) return res.status(400).json({ error: 'Saldo tidak mencukupi (termasuk biaya admin)' });
+
+      const ref = 'W' + Date.now().toString(36).toUpperCase();
+      const h2hUrl = `https://h2h.okeconnect.com/trx?memberID=${settings.h2hIdMerchant}&product=${instantMethod.code}&dest=${account_number}&qty=${amt}&refID=${ref}&pin=${settings.h2hPin}&password=${settings.h2hPassword}`;
+
+      try {
+        await axios.get(h2hUrl, { timeout: 15000 });
+      } catch (err) {
+        await User.findByIdAndUpdate(userId, { $inc: { balance: totalDeduct } });
+        console.error('Instant withdraw request error:', err.message);
+        if (botManager) botManager.notifyError('/api/withdraw (instant request)', err.message);
+        return res.status(500).json({ error: 'Gagal memproses permintaan instant withdrawal. Saldo dikembalikan.' });
+      }
+
+      const trx = await createWithRetry(Transaction, {
+        _id: generateCustomId(startId.withdraw),
+        userId,
+        type: 'withdraw',
+        amount: amt,
+        fee,
+        method: instantMethod.name,
+        methodCode: instantMethod.code,
+        accountNumber: account_number,
+        instant: true,
+        destination: account_number,
+        h2hRefId: ref,
+        status: 'pending'
+      }, 5, () => generateCustomId(startId.withdraw));
+
+      const userAfter = await User.findById(userId);
+      trx.balanceAfter = userAfter.balance;
+      await trx.save();
+
+      return res.json({
+        success: true,
+        message: 'Permintaan withdraw instan sedang diproses.',
+        data: {
+          id: trx._id,
+          amount: trx.amount,
+          fee: trx.fee,
+          method: trx.method,
+          accountNumber: trx.destination,
+          status: trx.status,
+          created_at: trx.createdAt,
+          balance_after: trx.balanceAfter
+        }
+      });
+    }
+
+    // Manual withdrawal
+    if (!account_number) return res.status(400).json({ error: 'account_number diperlukan untuk manual withdrawal' });
+
+    const methodLower = method.toLowerCase();
+    const manualMethod = (settings.withdrawMethods || []).find(
+      m => m.name.toLowerCase() === methodLower
+    );
+
+    if (!manualMethod) return res.status(400).json({ error: 'Metode penarikan manual tidak valid' });
+
+    const minAmount = manualMethod.min || 0;
+    if (minAmount > 0 && amt < minAmount) return res.status(400).json({ error: `Minimal penarikan untuk ${manualMethod.name} adalah Rp ${minAmount}` });
+    const maxManual = manualMethod.max || 1000000;
+    if (maxManual && amt > maxManual) return res.status(400).json({ error: `Maksimal penarikan untuk ${manualMethod.name} adalah Rp ${maxManual}` });
+
+    const fee = manualMethod.fee || 0;
+    const totalDeduct = amt + fee;
+
+    const updatedUser = await User.findOneAndUpdate(
+      { _id: userId, balance: { $gte: totalDeduct } },
+      { $inc: { balance: -totalDeduct } },
+      { new: true }
+    );
+
+    if (!updatedUser) return res.status(400).json({ error: 'Saldo tidak mencukupi (termasuk biaya admin)' });
+
+    const ref = 'W' + Date.now().toString(36).toUpperCase();
+    const wd = await createWithRetry(Transaction, {
+      _id: generateCustomId(startId.withdraw),
+      userId,
+      type: 'withdraw',
+      amount: amt,
+      fee,
+      method: manualMethod.name,
+      accountNumber: account_number,
+      status: 'pending',
+      reference: ref,
+      instant: false
+    }, 5, () => generateCustomId(startId.withdraw));
+
+    const userAfter = await User.findById(userId);
+    wd.balanceAfter = userAfter.balance;
+    await wd.save();
+
+    if (botManager) {
+      const user = await User.findById(userId).lean();
+      botManager.notifyWithdrawRequest(wd, user);
+    }
+
+    return res.json({
+      success: true,
+      message: 'Permintaan penarikan berhasil diajukan.',
+      data: {
+        id: wd._id,
+        amount: wd.amount,
+        fee: wd.fee,
+        method: wd.method,
+        account_number: wd.accountNumber,
+        status: wd.status,
+        created_at: wd.createdAt,
+        balance_after: wd.balanceAfter
+      }
+    });
+  } catch (e) {
+    console.error('/api/withdraw error:', e);
+    if (botManager) botManager.notifyError('/api/withdraw', e.message);
+    return res.status(500).json({ error: 'Terjadi kesalahan internal' });
+  }
+});
+
+app.get('/api/withdraw/status', ApiLimiter, apiAuth, async (req, res) => {
+  try {
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ error: 'ID withdraw diperlukan' });
+
+    const withdraw = await Transaction.findOne({
+      _id: id,
+      type: 'withdraw',
+      userId: req.apiUser
+    });
+
+    if (!withdraw) return res.status(404).json({ error: 'Data withdraw tidak ditemukan' });
+
+    const response = {
+      id: withdraw._id,
+      amount: withdraw.amount,
+      fee: withdraw.fee,
+      method: withdraw.method,
+      account_number: withdraw.accountNumber,
+      instant: withdraw.instant,
+      status: withdraw.status,
+      admin_note: withdraw.adminNote,
+      created_at: withdraw.createdAt,
+      completed_at: withdraw.completedAt
+    };
+
+    if (withdraw.status === 'paid' || withdraw.status === 'success') {
+      response.balance_after = withdraw.balanceAfter || null;
+    }
+
+    res.json(response);
+  } catch (e) {
+    console.error(e);
+    if (botManager) botManager.notifyError('/api/withdraw/status', e.message);
+    res.status(500).json({ error: 'Gagal memeriksa status withdraw' });
+  }
+});
+
+// ================== GRACEFUL SHUTDOWN ==================
+process.once('SIGINT', async () => { if (botManager) await botManager.stopBot(); process.exit(0); });
+process.once('SIGTERM', async () => { if (botManager) await botManager.stopBot(); process.exit(0); });
+
+app.listen(PORT, () => console.log(`🚀 Server berjalan di http://localhost:${PORT}`));
