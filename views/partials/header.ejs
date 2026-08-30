@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#ffffff" />
+  <title><%= typeof title !== 'undefined' ? title + ' - ' + settings.name : settings.name + ' - ' + settings.title %></title>
+  <meta name="google-site-verification" content="LRIQ3uK1QGUAFZ9uldMSGe8yyVcEVaIeAGSlj-HGkQg" />
+  
+  <!-- SEO -->
+  <meta name="robots" content="index, follow">
+  <meta name="author" content="Nevapedia">
+  <meta name="keywords" content="nevapedia, nevaqr, qris payment, payment gateway, qris, nevapedia app, pg, api gateway, nevapedia.com, payment gateway qris, qris otomatis, payment gateway indonesia, qr gateway, qris nevapedia, qris payment gateway, app nevapedia, deposit otomatis, withdraw otomatis, api qris">
+  <!-- Canonical -->
+  <link rel="canonical" href="https://app.nevapedia.com">
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="<%= typeof title !== 'undefined' ? title + ' - ' + settings.name : settings.name + ' - ' + settings.title %>">
+  <meta property="og:description" content="<%= settings.description || 'Payment Gateway QRIS Otomatis Indonesia' %>">
+  <meta property="og:url" content="https://app.nevapedia.com">
+  <meta property="og:site_name" content="<%= settings.name %>">
+
+  <% if (settings.logoUrl) { %>
+  <meta property="og:image" content="<%= settings.logoUrl %>">
+  <meta name="twitter:image" content="<%= settings.logoUrl %>">
+  <% } %>
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="<%= typeof title !== 'undefined' ? title + ' - ' + settings.name : settings.name + ' - ' + settings.title %>">
+  <meta name="twitter:description" content="<%= settings.description || 'Payment Gateway QRIS Otomatis Indonesia' %>">
+
+  <!-- Schema.org -->
+  <script type="application/ld+json">
+  {
+    "@context":"https://schema.org",
+    "@type":"Organization",
+    "name":"<%= settings.name %>",
+    "url":"https://app.nevapedia.com",
+    "logo":"<%= settings.logoUrl %>"
+  }
+  </script>  
+
+  <% if (settings.description) { %>
+  <meta name="description" content="<%= settings.description %>">
+  <% } %>
+
+  <% if (settings.logoUrl) { %>
+  <link rel="icon" type="image/jpeg" href="<%= settings.logoUrl %>">
+  <% } %>
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">  
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">  
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@200..900&display=swap" rel="stylesheet">
+  <script src="https://kit.fontawesome.com/7a016967ee.js" crossorigin="anonymous"></script>
+  <script>
+    tailwind.config = { 
+      theme: { 
+        extend: { 
+          fontFamily: { 
+            'sans': ['Inter', 'sans-serif']
+          }
+        } 
+      } 
+    }
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
+  <style>
+
+    ::-webkit-scrollbar { width: 2px; height: 2px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 10px; }
+    ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+    body { 
+      position: relative; 
+      background: #fafbfc; 
+      color: #1f2937;
+      font-family: 'Open Sans', sans-serif;
+      padding-top: 90px; 
+      -webkit-font-smoothing: antialiased;
+    }
+   
+
+    @media (max-width: 1023px) {
+      body { padding-top: 80px; } 
+    }
+
+    .fixed-navbar {
+      top: 0; left: 0; width: 100%; z-index: 40; 
+      position: fixed; 
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.05), 0 8px 24px -12px rgba(15, 23, 42, 0.08);
+      transition: background 0.3s, color 0.3s, box-shadow 0.3s;
+    }
+    .fixed-navbar.bg-white { background: rgba(255, 255, 255, 0.85); }
+    .fixed-navbar.bg-blue-500 {
+      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.08), 0 10px 30px -12px rgba(37, 99, 235, 0.45);
+    }
+
+    .sidebar-checkbox { display: none; }
+
+    /* ===== MENU MOBILE DENGAN EFEK HEIGHT HALUS ===== */
+    .mobile-menu {
+      position: fixed;
+      top: 55px;                      /* tepat di bawah navbar */
+      left: 0;
+      width: 100%;
+      max-height: 0;                  /* awalnya tertutup */
+      background: rgba(255, 255, 255, 0.97);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      overflow: hidden;               /* potong konten saat tertutup */
+      box-shadow: 0 16px 32px -16px rgba(15, 23, 42, 0.15);
+      transition: max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 39;
+      will-change: max-height;
+    }
+
+    .sidebar-checkbox:checked ~ .mobile-menu {
+      max-height: 1200px;             /* cukup besar untuk menampung semua link, termasuk jika ada tambahan */
+    }
+
+    .mobile-menu-inner {
+      padding-top: 1.2rem;
+      padding-bottom: 1.2rem;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+    }
+
+    /* Overlay di bawah navbar */
+    .mobile-menu-overlay {
+      position: fixed;
+      top: 55px;
+      left: 0;
+      width: 100%;
+      height: calc(100vh - 55px);
+      background: rgba(0, 0, 0, 0.0);
+      z-index: 38;
+      opacity: 0;
+      visibility: hidden;
+      transition: all 0.3s ease;
+      cursor: pointer;
+    }
+    .sidebar-checkbox:checked ~ .mobile-menu-overlay {
+      opacity: 1;
+      visibility: visible;
+    }
+
+    /* Desktop menu */
+    .desktop-menu { display: none; }
+    @media (min-width: 1024px) { 
+      .desktop-menu { display: flex; } 
+    }
+
+    /* Animasi hamburger */
+    .sidebar-line {
+      transition: all 0.3s ease;
+      transform-origin: center;
+    }
+    .sidebar-checkbox:checked ~ nav label .sidebar-line:nth-child(1) {
+      transform: translateY(9px) rotate(45deg);
+    }
+    .sidebar-checkbox:checked ~ nav label .sidebar-line:nth-child(2) {
+      opacity: 0;
+    }
+    .sidebar-checkbox:checked ~ nav label .sidebar-line:nth-child(3) {
+      transform: translateY(-7px) rotate(-45deg);
+    }
+  </style>
+</head>
+<body>
+ <script src="https://kit.fontawesome.com/7a016967ee.js" crossorigin="anonymous"></script>
+
+<%
+const isAdmin = (typeof user !== 'undefined' && user && user.role === 'admin');
+const isLoggedIn = (typeof user !== 'undefined' && user);
+const activePath = (typeof currentPath !== 'undefined') ? currentPath : '';
+%>
+
+<% if (isLoggedIn) { %>
+<input type="checkbox" id="sidebar-toggle" class="sidebar-checkbox">
+<% } %>
+
+<!-- Navbar -->
+<nav class="fixed-navbar <%= isLoggedIn ? 'bg-white border-b border-gray-200' : 'bg-blue-500 text-white border-b border-blue-600' %>">
+  <div class="max-w-7xl mx-auto flex justify-between items-center h-[58px] px-5 md:px-6">
+
+    <!-- Logo + Nama Aplikasi -->
+    <a href="/" class="flex items-center gap-2.5 h-full">
+      <% if (settings.logoUrl) { %>
+        <img
+          src="<%= settings.logoUrl %>"
+          alt="Logo"
+          class="h-8 w-auto object-contain rounded-md ring-1 ring-black/5"
+        />
+      <% } %>
+      <span class="font-semibold tracking-tight text-[18px] md:text-base <%= isLoggedIn ? 'text-gray-900' : 'text-white' %>">
+        <%= settings.name %>
+      </span>
+    </a>
+
+    <!-- Bagian kanan navbar -->
+    <% if (isLoggedIn) { %>
+      <label for="sidebar-toggle" class="flex flex-col justify-center items-end w-10 h-10 cursor-pointer z-50 gap-1.5 p-2 rounded-full hover:bg-gray-100 transition-colors">
+        <span class="block w-6 h-0.5 rounded-full bg-gray-700 sidebar-line"></span>
+        <span class="block w-4 h-0.5 rounded-full bg-gray-700 sidebar-line"></span>
+        <span class="block w-6 h-0.5 rounded-full bg-gray-700 sidebar-line"></span>
+      </label>
+    <% } else { %>
+      <a href="/login" class="bg-white text-blue-600 px-4 py-2 text-[13.5px] font-semibold rounded-full shadow-sm hover:shadow-md hover:-translate-y-0.5 transition-all duration-200">
+        Login/Daftar
+      </a>
+    <% } %>
+  </div>
+</nav>
+
+<% if (isLoggedIn) { %>
+<!-- Overlay -->
+<label for="sidebar-toggle" class="mobile-menu-overlay"></label>
+
+<!-- Dropdown menu dengan efek height halus -->
+<div id="mobile-navigation-links" class="mobile-menu">
+  <div class="mobile-menu-inner">
+    <div class="flex flex-col gap-1 px-5 text-[14px] max-w-lg mx-auto">
+      
+      <% if (user.role === 'admin') { %>
+        <!-- Admin -->
+        <a href="/admin/dashboard" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/admin/dashboard' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-house <%= activePath === '/admin/dashboard' ? 'text-white' : 'text-gray-800' %>"></i> Dashboard
+        </a>
+        <a href="/admin/users" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/admin/users' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-users <%= activePath === '/admin/users' ? 'text-white' : 'text-gray-800' %>"></i> Kelola User
+        </a>
+        <a href="/admin/withdraw" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/admin/withdraw' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-circle-arrow-down <%= activePath === '/admin/withdraw' ? 'text-white' : 'text-gray-800' %>"></i> Kelola Withdraw
+        </a>
+        <a href="/admin/transactions" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/admin/transactions' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-money-bill-1 <%= activePath === '/admin/transactions' ? 'text-white' : 'text-gray-800' %>"></i> Transaksi User
+        </a>
+        <a href="/admin/account" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/admin/account' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-user <%= activePath === '/admin/account' ? 'text-white' : 'text-gray-800' %>"></i> Profil
+        </a>            
+        <a href="/admin/settings" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/admin/settings' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-gear <%= activePath === '/admin/settings' ? 'text-white' : 'text-gray-800' %>"></i> Settings
+        </a>
+
+        <div class="h-px bg-gray-200 my-1 mx-2"></div>
+        <!-- Logout admin tetap merah -->
+        <a href="/logout" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium text-red-600 hover:bg-red-50">
+          <i class="fa-solid fa-right-from-bracket text-red-500"></i> Logout
+        </a>
+
+      <% } else { %>
+        <!-- User biasa -->
+        <a href="/dashboard" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/dashboard' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-house <%= activePath === '/dashboard' ? 'text-white' : 'text-gray-800' %>"></i> Dashboard
+        </a>
+        <a href="/deposit" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/deposit' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-money-bill-wave <%= activePath === '/deposit' ? 'text-white' : 'text-gray-800' %>"></i> Transaksi
+        </a>
+        <a href="/withdraw" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/withdraw' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-circle-arrow-down <%= activePath === '/withdraw' ? 'text-white' : 'text-gray-800' %>"></i> Penarikan
+        </a>
+        <a href="/profile" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/profile' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-user <%= activePath === '/profile' ? 'text-white' : 'text-gray-800' %>"></i> Profil
+        </a>
+        
+        <div class="h-px bg-gray-200 my-1 mx-2"></div>
+
+        <a href="/docs" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium <%= activePath === '/docs' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-700 hover:bg-gray-50' %>">
+          <i class="fa-solid fa-bars-staggered <%= activePath === '/docs' ? 'text-white' : 'text-gray-800' %>"></i> Panduan API
+        </a>
+        <!-- Informasi tetap biru -->
+        <a href="<%= settings.channelInformation %>" target="_blank" rel="noopener noreferrer" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium text-blue-600 hover:bg-blue-50">
+          <i class="fa fa-telegram text-blue-500"></i> Channel Telegram
+        </a>
+
+        <div class="h-px bg-gray-200 my-1 mx-2"></div>
+        <!-- Logout user tetap merah -->
+        <a href="/logout" class="flex items-center justify-center gap-2 w-full px-3 py-2.5 rounded-xl transition-all duration-200 font-medium text-red-600 hover:bg-red-50">
+          <i class="fa-solid fa-right-from-bracket text-red-500"></i> Logout
+        </a>
+      <% } %>
+    </div>
+  </div>
+</div>
+<% } %>
+
+<main class="max-w-[480px] min-h-[75vh] md:max-w-6xl mx-auto py-0">
+  <!-- Konten halaman dinamis -->
